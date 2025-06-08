@@ -12,6 +12,9 @@ import logging
 import os
 from dotenv import load_dotenv
 import optuna # Optuna importu
+import xgboost as xgb
+from catboost import CatBoostClassifier
+from sklearn.ensemble import RandomForestClassifier
 
 # ml_data_utils.py dosyasındaki fonksiyonları import et
 from ml_data_utils import get_klines_iterative, create_market_direction_target, create_features
@@ -122,6 +125,9 @@ def optimize_and_train_model():
     X_val_scaled = pd.DataFrame(X_val_scaled_np, columns=X_val.columns, index=X_val.index)
     X_test_scaled = pd.DataFrame(X_test_scaled_np, columns=X_test.columns, index=X_test.index)
 
+    # XGBoost ile de aynı veriyle model eğit ve test et
+    train_and_evaluate_xgboost(X_train_scaled, y_train, X_val_scaled, y_val, X_test_scaled, y_test)
+
     # Hiperparametre Optimizasyonu (Optuna)
     logging.info("Optuna ile hiperparametre optimizasyonu başlatılıyor...")
     study = optuna.create_study(direction='maximize') # Doğruluğu maksimize et
@@ -185,6 +191,179 @@ def optimize_and_train_model():
     joblib.dump(final_model, "market_direction_predictor_optimized_model.joblib")
     joblib.dump(scaler, "market_direction_predictor_scaler.joblib") # Scaler aynı kalır
     logging.info("Optimize edilmiş model ve scaler başarıyla kaydedildi.")
+
+    logging.info("\n--- Tahmin Olasılıkları ile Performans Analizi (Test Seti) ---")
+    y_pred_proba_test = final_model.predict_proba(X_test_scaled)
+
+    # Farklı olasılık eşiklerini deneyelim
+    # Sınıf sıralaması: model.classes_ ile kontrol edilebilir, genellikle alfabetik veya sayısal olur.
+    # Bizim etiketlerimiz 0:SHORT, 1:LONG, 2:NEUTRAL. LGBM genellikle bu sırayı korur.
+    # y_pred_proba_test[:, 0] -> SHORT olasılığı
+    # y_pred_proba_test[:, 1] -> LONG olasılığı
+    # y_pred_proba_test[:, 2] -> NEUTRAL olasılığı
+    
+    # model.classes_ ile doğru sıralamayı teyit edelim
+    if hasattr(final_model, 'classes_'):
+        logging.info(f"Model sınıfları (sıralama): {final_model.classes_} (0:SHORT, 1:LONG, 2:NEUTRAL eşleşmeli)")
+        # Eğer sıralama farklıysa, aşağıdaki indeksleri ona göre ayarlayın
+        idx_short = np.where(final_model.classes_ == 0)[0][0]
+        idx_long = np.where(final_model.classes_ == 1)[0][0]
+        idx_neutral = np.where(final_model.classes_ == 2)[0][0]
+    else: # Varsayılan sıralama
+        idx_short, idx_long, idx_neutral = 0, 1, 2
+        logging.warning("Model.classes_ bulunamadı, varsayılan sıralama (0:S, 1:L, 2:N) kullanılıyor.")
+
+
+    for threshold in [0.55, 0.60, 0.65, 0.70]:
+        logging.info(f"\n--- Olasılık Eşiği: {threshold*100:.0f}% ---")
+        
+        # Yeni tahminleri eşiğe göre yap
+        y_pred_thresholded = np.full(y_test.shape, idx_neutral) # Varsayılan NEUTRAL (sayısal etiket)
+
+        # LONG tahminleri
+        long_cond = y_pred_proba_test[:, idx_long] >= threshold
+        y_pred_thresholded[long_cond] = idx_long
+
+        # SHORT tahminleri (Eğer bir tahmin hem LONG hem SHORT için eşiği geçerse ne olacak?)
+        # Şimdilik, eğer LONG koşulu sağlandıysa onu koruyalım.
+        # Veya daha yüksek olasılıklı olanı seçebiliriz.
+        # Basitlik için:
+        short_cond = y_pred_proba_test[:, idx_short] >= threshold
+        y_pred_thresholded[short_cond & ~long_cond] = idx_short # LONG değilse ve SHORT eşiğini geçiyorsa
+
+        accuracy_thresh = accuracy_score(y_test, y_pred_thresholded)
+        logging.info(f"Genel Doğruluk (Eşikli): {accuracy_thresh*100:.2f}%")
+        
+        report_thresh = classification_report(y_test, y_pred_thresholded, labels=combined_labels_numeric, target_names=current_target_names, zero_division=0)
+        logging.info(f"Sınıflandırma Raporu (Eşikli):\n{report_thresh}")
+
+        cm_thresh = confusion_matrix(y_test, y_pred_thresholded, labels=combined_labels_numeric)
+        cm_df_thresh = pd.DataFrame(cm_thresh, 
+                                     index=current_target_names, 
+                                     columns=[f"Pred_{name}" for name in current_target_names])
+        print("Karışıklık Matrisi (Eşikli):")
+        print(cm_df_thresh)
+
+def train_and_evaluate_xgboost(X_train_scaled, y_train, X_val_scaled, y_val, X_test_scaled, y_test):
+    params = {
+        "objective": "multi:softmax",
+        "num_class": 3,
+        "eval_metric": "mlogloss",
+        "use_label_encoder": False,
+        "eta": 0.03,
+        "max_depth": 6,
+        "subsample": 0.7,
+        "colsample_bytree": 0.7,
+        "seed": 42,
+        "scale_pos_weight": 1  # Dengesiz veri için ayarlanabilir
+    }
+    model = xgb.XGBClassifier(**params)
+    model.fit(X_train_scaled, y_train, eval_set=[(X_val_scaled, y_val)], verbose=False)
+
+    y_pred_test = model.predict(X_test_scaled)
+    accuracy_test = accuracy_score(y_test, y_pred_test)
+    print(f"\n--- XGBoost Test Seti Performansı ---\nDoğruluk: {accuracy_test*100:.2f}%")
+
+    target_names = ['SHORT', 'LONG', 'NEUTRAL']
+    report = classification_report(y_test, y_pred_test, target_names=target_names, zero_division=0)
+    print("Sınıflandırma Raporu (XGBoost):\n", report)
+
+    cm = confusion_matrix(y_test, y_pred_test)
+    print("Karışıklık Matrisi (XGBoost):\n", cm)
+
+    # Özellik önemi
+    importances = model.feature_importances_
+    feature_importance_series = pd.Series(importances, index=X_train_scaled.columns)
+    print("--- Özellik Önem Sıralaması (XGBoost) ---")
+    print(feature_importance_series.sort_values(ascending=False).to_string())
+
+    return model
+
+def evaluate_model(model, X_train, y_train, X_val, y_val, X_test, y_test, model_name="Model"):
+    model.fit(X_train, y_train)
+    y_pred_test = model.predict(X_test)
+    accuracy_test = accuracy_score(y_test, y_pred_test)
+    print(f"\n--- {model_name} Test Seti Performansı ---\nDoğruluk: {accuracy_test*100:.2f}%")
+
+    target_names = ['SHORT', 'LONG', 'NEUTRAL']
+    report = classification_report(y_test, y_pred_test, target_names=target_names, zero_division=0)
+    print(f"Sınıflandırma Raporu ({model_name}):\n", report)
+
+    cm = confusion_matrix(y_test, y_pred_test)
+    print(f"Karışıklık Matrisi ({model_name}):\n", cm)
+
+    # Özellik önemi
+    if hasattr(model, 'feature_importances_'):
+        importances = model.feature_importances_
+        feature_importance_series = pd.Series(importances, index=X_train.columns)
+        print(f"--- Özellik Önem Sıralaması ({model_name}) ---")
+        print(feature_importance_series.sort_values(ascending=False).to_string())
+
+    return model
+
+def run_all_models(X_train_scaled, y_train, X_val_scaled, y_val, X_test_scaled, y_test):
+    # XGBoost
+    xgb_model = xgb.XGBClassifier(
+        objective="multi:softmax",
+        num_class=3,
+        eval_metric="mlogloss",
+        eta=0.03,
+        max_depth=6,
+        subsample=0.7,
+        colsample_bytree=0.7,
+        seed=42,
+        use_label_encoder=False
+    )
+    evaluate_model(xgb_model, X_train_scaled, y_train, X_val_scaled, y_val, X_test_scaled, y_test, "XGBoost")
+
+    # CatBoost
+    catboost_model = CatBoostClassifier(
+        iterations=300,
+        learning_rate=0.03,
+        depth=6,
+        loss_function='MultiClass',
+        verbose=False,
+        random_seed=42
+    )
+    evaluate_model(catboost_model, X_train_scaled, y_train, X_val_scaled, y_val, X_test_scaled, y_test, "CatBoost")
+
+    # RandomForest
+    rf_model = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=10,
+        random_state=42,
+        class_weight='balanced'
+    )
+    evaluate_model(rf_model, X_train_scaled, y_train, X_val_scaled, y_val, X_test_scaled, y_test, "RandomForest")
+
+def compare_all_models(X_train_scaled, y_train, X_val_scaled, y_val, X_test_scaled, y_test):
+    import xgboost as xgb
+    from catboost import CatBoostClassifier
+    from sklearn.ensemble import RandomForestClassifier
+    from lightgbm import LGBMClassifier
+
+    models = {
+        "LightGBM": LGBMClassifier(n_estimators=300, random_state=42, class_weight='balanced', verbosity=-1),
+        "XGBoost": xgb.XGBClassifier(objective="multi:softmax", num_class=3, eval_metric="mlogloss", eta=0.03, max_depth=6, subsample=0.7, colsample_bytree=0.7, seed=42, use_label_encoder=False),
+        "CatBoost": CatBoostClassifier(iterations=300, learning_rate=0.03, depth=6, loss_function='MultiClass', verbose=False, random_seed=42),
+        "RandomForest": RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42, class_weight='balanced')
+    }
+
+    for name, model in models.items():
+        print(f"\n========== {name} ==========")
+        model.fit(X_train_scaled, y_train)
+        y_pred_test = model.predict(X_test_scaled)
+        acc = accuracy_score(y_test, y_pred_test)
+        print(f"{name} Doğruluk: {acc*100:.2f}%")
+        print(classification_report(y_test, y_pred_test, target_names=['SHORT','LONG','NEUTRAL'], zero_division=0))
+        print("Önemli Özellikler:")
+        if hasattr(model, "feature_importances_"):
+            importances = model.feature_importances_
+            fi = pd.Series(importances, index=X_train_scaled.columns)
+            print(fi.sort_values(ascending=False).head(10))
+        print("="*40)
+
+
 
 if __name__ == "__main__":
     optimize_and_train_model()
