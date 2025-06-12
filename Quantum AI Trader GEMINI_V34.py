@@ -95,11 +95,11 @@ def get_ml_market_direction(df, model=None, scaler=None, features=None, retrain=
         max_up = np.max(future_pct_chg)
         min_down = np.min(future_pct_chg)
         if max_up >= threshold:
-            df_feat['target'].iloc[idx] = 1
+            df_feat.loc[idx, 'target'] = 1
         elif min_down <= -threshold:
-            df_feat['target'].iloc[idx] = 0
+            df_feat.loc[idx, 'target'] = 0
         else:
-            df_feat['target'].iloc[idx] = np.nan
+            df_feat.loc[idx, 'target'] = np.nan   # <-- Burayı düzelttim
 
     df_train = df_feat.dropna(subset=features + ['target'])
     if len(df_train) < 40:
@@ -617,6 +617,12 @@ class QuantumTrader:
         self.symbol_info = {}
         self.last_fast_market_direction = None
         self.last_fast_market_direction_update_time = datetime.now(IST_TIMEZONE) - timedelta(minutes=10) # Bot başlar başlamaz güncellensin diye
+    
+    async def get_balance(self, *args, **kwargs):
+        if getattr(self, "backtest", False):
+            return 10000  # Backtest için sabit yüksek bir bakiye döndür
+    # Gerçek API çağrısı buraya
+        ...
 
     async def __aenter__(self):
         """Bot başladığında oturumu başlatır, exchange bilgilerini ve pozisyonları yükler."""
@@ -1667,10 +1673,15 @@ class QuantumTrader:
 
     async def execute_trade(self, symbol: str, direction: str, current_price: float, confidence: float, atr: float):
         try:
-            if symbol not in self.symbol_info:
-                logging.error(f"[{symbol}] Exchange bilgisi yüklenmedi. Trade açılamadı.")
-                await self.send_smart_telegram_message(f"⛔ {symbol} için borsa bilgisi alınamadı. Trade açılamadı.", msg_type='ERROR', symbol=symbol)
-                return
+            if not getattr(self, "backtest", False):
+                if balance <= 0:
+                    logging.error(f"[{symbol}] Bakiye sıfır veya negatif. Trade açılamadı.")
+                    await self.send_smart_telegram_message(
+                        f"⛔ {symbol} için borsa bilgisi alınamadı. Trade açılamadı.",
+                        msg_type='ERROR',
+                        symbol=symbol
+                    )
+                    return
             
             s_info = self.symbol_info[symbol]
 
@@ -1735,7 +1746,7 @@ class QuantumTrader:
                 await self.send_smart_telegram_message(f"⚠️ {symbol} için RR ({rr:.2f}) çok düşük. Trade açılamadı.", msg_type='WARNING', symbol=symbol)
                 return
 
-            balance = await self.get_binance_balance()
+            balance = await self.get_balance()
             if balance <= 0:
                 logging.error(f"[{symbol}] Bakiye sıfır veya negatif. Trade açılamadı.")
                 await self.send_smart_telegram_message(f"⛔ {symbol} için bakiye yetersiz. Trade açılamadı.", msg_type='ERROR', symbol=symbol)
