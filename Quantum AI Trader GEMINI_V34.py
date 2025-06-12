@@ -1673,15 +1673,17 @@ class QuantumTrader:
 
     async def execute_trade(self, symbol: str, direction: str, current_price: float, confidence: float, atr: float):
         try:
-            if not getattr(self, "backtest", False):
-                if balance <= 0:
-                    logging.error(f"[{symbol}] Bakiye sıfır veya negatif. Trade açılamadı.")
-                    await self.send_smart_telegram_message(
-                        f"⛔ {symbol} için borsa bilgisi alınamadı. Trade açılamadı.",
-                        msg_type='ERROR',
-                        symbol=symbol
-                    )
-                    return
+            s_info = self.symbol_info[symbol]
+            # ----- HESAPLAMA BLOKLARI -----
+            min_tick = s_info.tick_size
+            # ... diğer hesaplamalar ...
+            position_size = ... # hesapla
+            final_quantity_to_send = self.format_quantity(symbol, position_size)
+            # -------------------------------
+            if getattr(self, "backtest", False):
+                logging.info(f"[BACKTEST] {symbol} için trade açıldı (simülasyon): {direction}, fiyat: {current_price}, qty: {final_quantity_to_send}")
+                profit = ... # dummy bir simülasyon
+                return {"profit": profit}
             
             s_info = self.symbol_info[symbol]
 
