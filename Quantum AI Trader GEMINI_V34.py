@@ -78,7 +78,7 @@ SYMBOLS = [
 
 SYMBOL_LEVERAGE = {s: 20 for s in SYMBOLS}
 
-def get_ml_market_direction(df, model=None, scaler=None, features=None, retrain=False, lookforward=4, threshold=0.0075, prob_long=0.52, prob_short=0.48):
+def get_ml_market_direction(df, model=None, scaler=None, features=None, retrain=False, lookforward=4, threshold=0.0075, prob_long=0.5, prob_short=0.5):
     df_feat = ml_feature_engineering(df)
     features = features or [
         "ema_diff", "ema_cross_up", "ema_cross_down",
@@ -2075,23 +2075,18 @@ class QuantumTrader:
             logging.info(f"[{symbol}] Hızlı Piyasa Yönü Filtresi (Önbellekli): {market_direction}")
 
             # Sinyal eşiklerini buradan alabilirsiniz veya konfigürasyondan
-            long_signal_threshold = 0.52 
-            short_signal_threshold = 0.48
+            long_signal_threshold = 0.45 
+            short_signal_threshold = 0.55
 
-            if avg_prediction > long_signal_threshold and trend_up:
-                if market_direction == 'LONG' or market_direction == 'NEUTRAL':
-                    logging.info(f"[{symbol}] LONG sinyali ({avg_prediction:.3f}) VE Piyasa Yönü ({market_direction}) UYGUN. İşlem açılıyor.")
-                    await self.execute_trade(symbol, 'LONG', current_price, avg_prediction, current_atr)
-                else:
-                    logging.info(f"[{symbol}] LONG sinyali ({avg_prediction:.3f}) var ANCAK Piyasa Yönü ({market_direction}) UYGUN DEĞİL. İşlem açılmayacak.")
-            elif avg_prediction < short_signal_threshold and trend_down:
-                if market_direction == 'SHORT' or market_direction == 'NEUTRAL':
-                    logging.info(f"[{symbol}] SHORT sinyali ({avg_prediction:.3f}) VE Piyasa Yönü ({market_direction}) UYGUN. İşlem açılıyor.")
-                    await self.execute_trade(symbol, 'SHORT', current_price, avg_prediction, current_atr)
-                else:
-                    logging.info(f"[{symbol}] SHORT sinyali ({avg_prediction:.3f}) var ANCAK Piyasa Yönü ({market_direction}) UYGUN DEĞİL. İşlem açılmayacak.")
+            if avg_prediction > long_signal_threshold:
+                await self.execute_trade(symbol, 'LONG', ...)
+            elif avg_prediction < short_signal_threshold:
+                await self.execute_trade(symbol, 'SHORT', ...)
             else:
-                logging.debug(f"[{symbol}] için geçerli bir işlem sinyali yok. Ortalama Tahmin: {avg_prediction:.3f}, Trend Up: {trend_up}, Trend Down: {trend_down}")
+                logging.debug(f"[{symbol}] için geçerli bir işlem sinyali yok. Ortalama Tahmin: {avg_prediction:.3f}")
+            
+            if i < 50:
+                print(f"{i}: avg_prediction: {avg_prediction}")
 
         except Exception as e:
             logging.error(f"[{symbol}] process_symbol içinde genel analiz hatası: {str(e)}", exc_info=True)
