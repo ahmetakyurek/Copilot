@@ -1,33 +1,17 @@
-# train_market_predictor.py (Sadece XGBoost Optimizasyonu)
-
 import pandas as pd
 import numpy as np
 from binance.client import Client
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix # roc_auc_score, roc_curve kaldırıldı
-# from sklearn.feature_selection import RFE # RFE kaldırıldı, tüm özellikler kullanılacak
-# from sklearn.ensemble import RandomForestClassifier, StackingClassifier # Diğer modeller kaldırıldı
-# from sklearn.linear_model import LogisticRegression # Diğer modeller kaldırıldı
-# from lightgbm import LGBMClassifier # Diğer modeller kaldırıldı
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_auc_score
 import xgboost as xgb
-# from catboost import CatBoostClassifier # Diğer modeller kaldırıldı
-from imblearn.over_sampling import SMOTE # SMOTE sınıf dengesizliği için kalabilir
-# import matplotlib.pyplot as plt # Görselleştirme kaldırıldı
-# import seaborn as sns # Görselleştirme kaldırıldı
+from imblearn.over_sampling import SMOTE
 import joblib
 import logging
 import os
 from dotenv import load_dotenv
 import optuna
-# import ta # Bu, ml_data_utils.py içinde kullanılıyor, burada doğrudan gerek yok
-from ml_data_utils import get_klines_iterative, create_features # create_market_direction_target yerine create_binary_target kullanılacak
+from ml_data_utils import get_klines_iterative, create_features
 import sys
-import xgboost as xgb
-print("PYTHON:", sys.executable)
-print("XGBOOST VERSION:", xgb.__version__)
-print("XGBOOST FILE:", xgb.__file__)
-print("XGBClassifier.fit:", xgb.XGBClassifier.fit)
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -130,11 +114,13 @@ def objective_xgboost(trial, X_train_fs, y_train_bal, X_val_fs, y_val):
     }
 
     model = xgb.XGBClassifier(**params)
+    print("DEBUG: model.fit =", model.fit)
+    print("DEBUG: model.fit module =", model.fit.__module__)
     model.fit(
         X_train_fs,
         y_train_bal,
         eval_set=[(X_val_fs, y_val)],
-        early_stopping_rounds=25,
+        # early_stopping_rounds=25,  # Bunu KALDIR
         verbose=False
     )
     
@@ -293,6 +279,145 @@ def optimize_and_train_xgboost_model(n_optuna_trials=30): # Optuna deneme sayıs
     joblib.dump(final_xgb_model, "market_direction_xgb_model.joblib")
     joblib.dump(scaler, "market_direction_xgb_scaler.joblib")
     logging.info("XGBoost modeli ve scaler başarıyla kaydedildi.")
+
+    logging.info("\n--- XGBoost Tahmin Olasılıkları ile Performans Analizi (Test Seti) ---")
+    # y_pred_proba_test_xgb zaten hesaplanmıştı: final_xgb_model.predict_proba(X_test_scaled)
+    # Bu (n_samples, n_classes) şeklinde bir arraydir.
+    # Bizim durumumuzda n_classes = 2 (0:SHORT, 1:LONG)
+
+    # Modelin sınıflarının sıralamasını alalım (genellikle [0, 1] olur ama teyit edelim)
+    model_classes_xgb = final_xgb_model.classes_
+    logging.info(f"XGBoost Model Sınıfları (sıralama): {model_classes_xgb} (Beklenen: 0:SHORT, 1:LONG)")
+    
+    try:
+        # Sınıf etiketlerine karşılık gelen indeksleri bul
+        # Bu, model.classes_ sıralaması her zaman [0, 1] olmasa bile doğru çalışır.
+        idx_short_xgb = np.where(model_classes_xgb == 0)[0][0]
+        idx_long_xgb = np.where(model_classes_xgb == 1)[0][0]
+    except IndexError:
+        logging.error("XGBoost model sınıfları beklenenden farklı veya eksik. Varsayılan sıralama (0:SHORT, 1:LONG) kullanılıyor.")
+        idx_short_xgb, idx_long_xgb = 0, 1 # Varsayılan, eğer model.classes_ [0,1] ise
+
+    # Olasılıkları alalım
+    # y_pred_proba_test_xgb[:, idx_short_xgb] -> SHORT olasılığı
+    # y_pred_proba_test_xgb[:, idx_long_xgb]  -> LONG olasılığı
+    # Daha önce y_pred_proba_test_xgb'yi sadece pozitif sınıfın (LONG) olasılığı olarak almıştık.
+    # Şimdi tüm olasılık matrisine ihtiyacımız var.
+    all_probabilities_xgb = final_xgb_model.predict_proba(X_test_scaled)
+
+
+    for threshold_pct in [50, 55, 60, 65, 70, 75, 80]: # Yüzde olarak eşikler
+        threshold = threshold_pct / 100.0
+        logging.info(f"\n--- Olasılık Eşiği (XGBoost): {threshold_pct}% ---")
+        
+        # Yeni tahminleri eşiğe göre yap
+        # Bu ikili bir sınıflandırma olduğu için, bir yöne karar veremezsek
+        # "işlem yapma" veya "belirsiz" gibi bir durum olmayacak doğrudan.
+        # Ya SHORT ya da LONG diyeceğiz (veya birini varsayılan yapacağız).
+        # Ya da, eğer her iki olasılık da eşiğin altındaysa, bir "NEUTRAL_IMPLIED" durumu yaratabiliriz.
+        
+        # Strateji 1: Sadece bir sınıf eşiği geçerse o sınıfı ata, yoksa bir varsayılan ata (örn: çoğunluk sınıfı)
+        # Strateji 2: Yüksek olasılıklı olanı seç, eğer o olasılık da eşiği geçiyorsa.
+        # Strateji 3 (Burada uygulayacağımız): Her iki yönde de sinyal yoksa, bunu pratikte "işlem yok" (NEUTRAL gibi) olarak yorumlayabiliriz.
+        # Ancak classification_report hala ikili (SHORT/LONG) metrikler verecektir.
+        # Karışıklığı önlemek için, eğer hiçbir sınıf eşiği geçmezse, çoğunluk sınıfını (SHORT) tahmin edelim.
+        # Ya da daha iyisi, eğer amacımız yüksek kesinlikli sinyallerse, eşiği geçmeyenleri "tahmin yok" (NaN) gibi işaretleyip,
+        # sadece eşiği geçenler üzerinden precision/recall hesaplayabiliriz.
+        # Şimdilik, "tahmin yok" yerine, en olası olanı veya bir varsayılanı atayalım.
+
+        # Yeni y_pred_thresholded_xgb oluşturalım
+        # Eğer LONG olasılığı >= threshold ise LONG (1)
+        # Eğer SHORT olasılığı >= threshold ise SHORT (0)
+        # Eğer ikisi de değilse (veya ikisi de eşiği geçiyorsa), ne yapmalı?
+        # Öncelik: Daha yüksek olasılıklı olan ve eşiği geçen.
+        # Eğer ikisi de eşiği geçiyorsa, en yüksek olasılıklı olan.
+        # Eğer hiçbiri eşiği geçmiyorsa, modelin normalde tahmin edeceği (en yüksek olasılıklı) sınıfı alalım.
+        
+        y_pred_thresholded_xgb = np.argmax(all_probabilities_xgb, axis=1) # Önce varsayılan tahminleri al
+        
+        prob_short_class = all_probabilities_xgb[:, idx_short_xgb]
+        prob_long_class = all_probabilities_xgb[:, idx_long_xgb]
+
+        # Koşulları belirle
+        is_confident_short = prob_short_class >= threshold
+        is_confident_long = prob_long_class >= threshold
+
+        # Güncelleme mantığı:
+        # 1. Güvenli LONG varsa ata
+        # 2. Güvenli LONG yoksa AMA güvenli SHORT varsa ata
+        # 3. İkisi de güvenli değilse, ilk (argmax) tahmini kalsın.
+
+        temp_preds = y_pred_thresholded_xgb.copy() # Orijinali değiştirmemek için kopya
+
+        # Herhangi bir yön için eşik geçilmiyorsa, o tahmini geçersiz kılabiliriz (örn: -1 ata)
+        # ve sadece geçerli tahminler üzerinden metrik hesaplayabiliriz. Bu, "işlem yapmama" durumunu simüle eder.
+        # Bu, "support" sayılarını azaltır ama precision'ı daha anlamlı kılar.
+        
+        # Yeni yaklaşım: Eğer bir sinyal eşiği geçmiyorsa, onu "tahmin edilmedi" sayalım.
+        # Ve metrikleri sadece tahmin edilenler üzerinden hesaplayalım.
+        # Ya da, 3 sınıflı (SHORT, LONG, NO_SIGNAL) bir çıktıya dönüştürelim.
+        # Şimdilik, sadece precision'a odaklanmak için, eşiği geçmeyenleri filtreden çıkaralım.
+
+        actual_y_for_eval = []
+        predicted_y_for_eval = []
+
+        for i in range(len(y_test)):
+            predicted_class = -1 # Varsayılan: sinyal yok
+            if is_confident_long[i] and (not is_confident_short[i] or prob_long_class[i] >= prob_short_class[i]):
+                predicted_class = idx_long_xgb
+            elif is_confident_short[i]: # Zaten ~is_confident_long[i] veya long olasılığı daha düşük
+                predicted_class = idx_short_xgb
+            
+            if predicted_class != -1: # Sadece güvenli bir tahmin varsa değerlendirmeye kat
+                actual_y_for_eval.append(y_test.iloc[i])
+                predicted_y_for_eval.append(predicted_class)
+        
+        if not actual_y_for_eval: # Eğer hiçbir güvenli tahmin üretilemediyse
+            logging.warning(f"Olasılık eşiği {threshold_pct}% ile hiç güvenli tahmin üretilemedi.")
+            continue
+
+        actual_y_for_eval = np.array(actual_y_for_eval)
+        predicted_y_for_eval = np.array(predicted_y_for_eval)
+        
+        accuracy_thresh = accuracy_score(actual_y_for_eval, predicted_y_for_eval)
+        logging.info(f"Genel Doğruluk (Eşikli, Sadece Güvenli Tahminler): {accuracy_thresh*100:.2f}%")
+        
+        # Sınıflandırma raporu ve karışıklık matrisi için etiketleri doğru alalım
+        unique_labels_actual_thresh = np.unique(actual_y_for_eval)
+        unique_labels_pred_thresh = np.unique(predicted_y_for_eval)
+        # Hem gerçekte hem de tahminde olan tüm etiketleri alalım
+        combined_labels_numeric_thresh = np.unique(np.concatenate((unique_labels_actual_thresh, unique_labels_pred_thresh))).astype(int)
+        
+        # Eğer bir sınıf hiç oluşmadıysa (örn: tüm tahminler SHORT ise ve gerçekte LONG yoksa), target_names'te sorun olabilir.
+        # target_names her zaman ['SHORT', 'LONG'] olmalı.
+        # labels parametresi, raporda hangi sınıfların gösterileceğini belirler.
+        # Eğer bir sınıf hiç tahmin edilmediyse veya gerçekte yoksa, raporda 0 support ile görünebilir.
+
+        current_target_names_thresh = [class_labels_binary_str[i] for i in combined_labels_numeric_thresh if i < len(class_labels_binary_str)]
+        if not current_target_names_thresh: # Eğer hiç etiket yoksa (çok nadir)
+             if combined_labels_numeric_thresh.size > 0: # En az bir etiket varsa ama isim bulunamadıysa
+                 current_target_names_thresh = [str(l) for l in combined_labels_numeric_thresh] # Sayısal olarak kullan
+             else: # Hiç etiket yoksa (çok çok nadir)
+                 logging.warning("Eşikli değerlendirme için hiç etiket bulunamadı.")
+                 continue
+
+
+        report_thresh = classification_report(actual_y_for_eval, predicted_y_for_eval, 
+                                              labels=combined_labels_numeric_thresh, 
+                                              target_names=current_target_names_thresh, 
+                                              zero_division=0)
+        logging.info(f"Sınıflandırma Raporu (Eşikli, Sadece Güvenli Tahminler):\n{report_thresh}")
+
+        cm_thresh = confusion_matrix(actual_y_for_eval, predicted_y_for_eval, labels=combined_labels_numeric_thresh)
+        # Eğer cm_thresh boşsa veya current_target_names_thresh boşsa hata alabiliriz.
+        if cm_thresh.size > 0 and current_target_names_thresh:
+            cm_df_thresh = pd.DataFrame(cm_thresh, 
+                                         index=current_target_names_thresh, 
+                                         columns=[f"Pred_{name}" for name in current_target_names_thresh])
+            print("Karışıklık Matrisi (Eşikli, Sadece Güvenli Tahminler):")
+            print(cm_df_thresh)
+        else:
+            logging.warning("Karışıklık matrisi oluşturulamadı (veri yok veya etiket isimleri eksik).")
 
 if __name__ == "__main__":
     # n_optuna_trials sayısını buradan ayarlayabilirsiniz veya script içinde sabit bırakabilirsiniz.
