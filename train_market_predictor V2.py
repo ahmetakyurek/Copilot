@@ -21,6 +21,12 @@ from dotenv import load_dotenv
 import optuna
 # import ta # Bu, ml_data_utils.py içinde kullanılıyor, burada doğrudan gerek yok
 from ml_data_utils import get_klines_iterative, create_features # create_market_direction_target yerine create_binary_target kullanılacak
+import sys
+import xgboost as xgb
+print("PYTHON:", sys.executable)
+print("XGBOOST VERSION:", xgb.__version__)
+print("XGBOOST FILE:", xgb.__file__)
+print("XGBClassifier.fit:", xgb.XGBClassifier.fit)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -124,11 +130,13 @@ def objective_xgboost(trial, X_train_fs, y_train_bal, X_val_fs, y_val):
     }
 
     model = xgb.XGBClassifier(**params)
-    model.fit(X_train_fs, 
-              y_train_bal, 
-              eval_set=[(X_val_fs, y_val)], 
-              early_stopping_rounds=25, # Bu parametrenin burada çalışması lazım
-              verbose=False) # veya verbose=0
+    model.fit(
+        X_train_fs,
+        y_train_bal,
+        eval_set=[(X_val_fs, y_val)],
+        early_stopping_rounds=25,
+        verbose=False
+    )
     
     y_pred_val = model.predict(X_val_fs)
     accuracy = accuracy_score(y_val, y_pred_val)
