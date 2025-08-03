@@ -1610,10 +1610,23 @@ class TradingStrategy:
         action = "BUY" if news.sentiment_score > 0 else "SELL"
         params = self.risk_params.get(news.impact_level, self.risk_params["MEDIUM"])
         
-        sl_price = current_price * (1 - params["stop_loss"]) if action == "BUY" else current_price * (1 + params["stop_loss"])
-        tp_price = current_price * (1 + params["take_profit"]) if action == "BUY" else current_price * (1 - params["take_profit"])
+        # ✅ ENHANCED TP/SL CALCULATION WITH VALIDATION
+        if action == "BUY":
+            sl_price = current_price * (1 - params["stop_loss"])
+            tp_price = current_price * (1 + params["take_profit"])
+        else:  # SELL
+            sl_price = current_price * (1 + params["stop_loss"])
+            tp_price = current_price * (1 - params["take_profit"])
         
-        logger.info(f"✅ Sinyal üretildi: {action} | Güven: {confidence:.2f} | Impact: {news.impact_level}")
+        # ✅ VALIDATION: Ensure TP is in correct direction
+        if action == "BUY" and tp_price <= current_price:
+            logger.warning(f"⚠️ BUY TP calculation error, fixing: TP={tp_price:.4f} <= Entry={current_price:.4f}")
+            tp_price = current_price * 1.02  # Force %2 profit for BUY
+        elif action == "SELL" and tp_price >= current_price:
+            logger.warning(f"⚠️ SELL TP calculation error, fixing: TP={tp_price:.4f} >= Entry={current_price:.4f}")
+            tp_price = current_price * 0.98  # Force %2 profit for SELL
+        
+        logger.info(f"✅ Sinyal üretildi: {action} | Entry: ${current_price:.4f} | SL: ${sl_price:.4f} | TP: ${tp_price:.4f} | Güven: {confidence:.2f}")
         
         return TradeSignal(
             symbol="", action=action, confidence=confidence, expected_impact=news.impact_level,
@@ -2409,10 +2422,26 @@ class CryptoNewsBot:
                 await asyncio.sleep(60)
 
     async def create_conditional_order(self, symbol: str, side: str, order_type: str, amount: float, trigger_price: float):
-        """Gate.io için düzeltilmiş koşullu emir fonksiyonu - Fiyat formatı düzeltildi."""
+        """Gate.io için düzeltilmiş koşullu emir fonksiyonu - TP trigger price validation eklendi."""
         exchange = self.exchange
         try:
             order_side = 'sell' if side.upper() == 'BUY' else 'buy'
+            
+            # ✅ VALIDATE TRIGGER PRICE BEFORE SENDING ORDER
+            current_price = await self.get_current_price(symbol)
+            if current_price:
+                # Validate trigger price based on order type and side
+                if order_type == "TAKE-PROFIT":
+                    if side.upper() == 'BUY' and trigger_price <= current_price:
+                        logger.error(f"❌ [{symbol}] TP fiyatı mevcut fiyattan düşük: TP=${trigger_price:.4f} <= Current=${current_price:.4f}")
+                        # Fix TP price calculation
+                        trigger_price = current_price * 1.02  # %2 kar hedefi
+                        logger.info(f"✅ [{symbol}] TP fiyatı düzeltildi: ${trigger_price:.4f}")
+                    elif side.upper() == 'SELL' and trigger_price >= current_price:
+                        logger.error(f"❌ [{symbol}] SHORT TP fiyatı mevcut fiyattan yüksek: TP=${trigger_price:.4f} >= Current=${current_price:.4f}")
+                        # Fix TP price calculation for short
+                        trigger_price = current_price * 0.98  # %2 kar hedefi short için
+                        logger.info(f"✅ [{symbol}] SHORT TP fiyatı düzeltildi: ${trigger_price:.4f}")
             
             # ✅ FİYAT FORMATINI DÜZELTELİM
             formatted_trigger_price = float(exchange.price_to_precision(symbol, trigger_price))
