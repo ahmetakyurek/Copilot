@@ -350,6 +350,7 @@ class Position:
     sl_order_id: Optional[str] = None
     tp_order_id: Optional[str] = None
     news_item: Optional[NewsItem] = None
+    position_created_at: Optional[datetime] = None  # For phantom position grace period
 
 # --- CONFIG MANAGER ---
 class ConfigManager:
@@ -547,10 +548,12 @@ class CsvLogger:
                 pnl_percent = (position.pnl / (position.entry_price * position.size)) * 100 if position.entry_price * position.size != 0 else 0
 
                 # Eğer haber bilgisi yoksa varsayılan değerler kullan
-                news_source = news_item.source if news_item else "N/A"
-                news_title = news_item.title.replace(",", ";") if news_item else "N/A" # Virgülleri değiştir
-                sentiment = news_item.sentiment_score if news_item else 0.0
-                impact = news_item.impact_level if news_item else "N/A"
+                news_source = getattr(news_item, 'source', 'N/A') if news_item else "N/A"
+                news_title = getattr(news_item, 'title', 'N/A') if news_item else "N/A"
+                if news_title != "N/A":
+                    news_title = news_title.replace(",", ";")  # Virgülleri değiştir
+                sentiment = getattr(news_item, 'sentiment_score', 0.0) if news_item else 0.0
+                impact = getattr(news_item, 'impact_level', 'N/A') if news_item else "N/A"
                 
                 row = [
                     now_utc.strftime("%Y-%m-%d %H:%M:%S"),
@@ -2357,10 +2360,20 @@ class CryptoNewsBot:
                 await asyncio.sleep(60)
 
     async def create_conditional_order(self, symbol: str, side: str, order_type: str, amount: float, trigger_price: float):
-        """Gate.io için düzeltilmiş koşullu emir fonksiyonu - Fiyat formatı düzeltildi."""
+        """Gate.io için düzeltilmiş koşullu emir fonksiyonu - Fiyat formatı ve TP/SL validasyonu düzeltildi."""
         exchange = self.exchange
         try:
             order_side = 'sell' if side.upper() == 'BUY' else 'buy'
+            
+            # ✅ TAKE-PROFIT FİYAT VALİDASYONU
+            if order_type == "TAKE-PROFIT":
+                current_price = await self.get_current_price(symbol)
+                if current_price:
+                    # BUY pozisyon için TP yukarıda olmalı, SELL pozisyon için TP aşağıda olmalı
+                    if side.upper() == 'BUY' and trigger_price <= current_price:
+                        logger.warning(f"[{symbol}] TP fiyat uyarısı: BUY pozisyon için TP ({trigger_price}) güncel fiyattan ({current_price}) yüksek olmalı")
+                    elif side.upper() == 'SELL' and trigger_price >= current_price:
+                        logger.warning(f"[{symbol}] TP fiyat uyarısı: SELL pozisyon için TP ({trigger_price}) güncel fiyattan ({current_price}) düşük olmalı")
             
             # ✅ FİYAT FORMATINI DÜZELTELİM
             formatted_trigger_price = float(exchange.price_to_precision(symbol, trigger_price))
@@ -2754,12 +2767,14 @@ class CryptoNewsBot:
                 logger.warning(f"⚠️ [{symbol}] API Stop Loss başarısız, manuel takip devrede")
             
             # Pozisyonu her durumda kaydet (manuel takip varken acil kapatma yok)
+            now = datetime.now()
             position = Position(
                 symbol=symbol, side=signal.action, size=filled_amount, entry_price=entry_price,
                 current_price=entry_price, stop_loss=signal.stop_loss, take_profit=signal.take_profit,
-                pnl=0.0, timestamp=datetime.now(), exchange=self.exchange.id, volatility=signal.volatility,
+                pnl=0.0, timestamp=now, exchange=self.exchange.id, volatility=signal.volatility,
                 sl_order_id=sl_order_id, tp_order_id=tp_order_id, news_item=news_item,
-                highest_price_seen=entry_price, lowest_price_seen=entry_price, trailing_stop=signal.stop_loss
+                highest_price_seen=entry_price, lowest_price_seen=entry_price, trailing_stop=signal.stop_loss,
+                position_created_at=now  # Set creation timestamp for grace period
             )
             # ✅ DATABASE'E KAYDET
             if self.database:
@@ -2776,6 +2791,49 @@ class CryptoNewsBot:
         except Exception as e:
             logger.error(f"❌ [{symbol}] setup_position_protections hatası: {e}")
 
+    def normalize_symbol(self, symbol: str) -> str:
+        """Normalize symbol format for consistent API calls"""
+        if not symbol:
+            return symbol
+        
+        # Gate.io expects symbols in format like 'ALPHA_USDT' for futures
+        if self.exchange.id == 'gateio':
+            # Convert ALPHA/USDT to ALPHA_USDT
+            if '/' in symbol:
+                return symbol.replace('/', '_')
+            # Already in correct format
+            return symbol
+        
+        return symbol
+
+    async def check_position_with_retry(self, symbol, max_retries=3, delay=2):
+        """Position kontrolü retry ile"""
+        normalized_symbol = self.normalize_symbol(symbol)
+        
+        for attempt in range(max_retries):
+            try:
+                exchange = self.exchange
+                params = {}
+                if exchange.id == 'gateio': 
+                    params = {'settle': 'usdt'}
+                
+                positions = await self.loop.run_in_executor(None, exchange.fetch_positions, [normalized_symbol], params)
+                for pos in positions:
+                    pos_symbol = self.normalize_symbol(pos['symbol'])
+                    if pos_symbol == normalized_symbol and abs(float(pos.get('contracts', 0))) > 0:
+                        return pos
+                
+                if attempt < max_retries - 1:
+                    logger.debug(f"[{symbol}] Position check attempt {attempt + 1} failed, retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                    
+            except Exception as e:
+                logger.error(f"Position check attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(delay)
+        
+        return None
+
     async def update_live_positions(self):
         """Açık pozisyonları yönetir ve hayalet pozisyonları temizler."""
         if not self.live_positions: 
@@ -2787,16 +2845,34 @@ class CryptoNewsBot:
             if exchange.id == 'gateio': 
                 params = {'settle': 'usdt'}
             
-            # API'den gerçek pozisyonları al
+            # API'den gerçek pozisyonları al - retry mechanism ile
             positions_from_api = await self.loop.run_in_executor(None, exchange.fetch_positions, [], params)
-            active_symbols_on_api = {pos['symbol'] for pos in positions_from_api if float(pos.get('contracts', 0)) > 0}
+            active_symbols_on_api = {self.normalize_symbol(pos['symbol']) for pos in positions_from_api if float(pos.get('contracts', 0)) > 0}
             
             # Kapatılan pozisyonları tespit et
             for position_key, position in list(self.live_positions.items()):
                 
-                # ✅ HAYALET POZİSYON KONTROLÜ
-                if position.symbol not in active_symbols_on_api:
-                    logger.info(f"🔄 [{position.symbol}] API'de bulunamadı, hayalet pozisyon temizleniyor")
+                # ✅ GRACE PERIOD - Yeni pozisyonları 60 saniye koruma altına al
+                now = datetime.now()
+                position_age_seconds = (now - (position.position_created_at or position.timestamp)).total_seconds()
+                
+                if position_age_seconds < 60:
+                    logger.debug(f"[{position.symbol}] Position still in grace period ({position_age_seconds:.1f}s), skipping phantom check")
+                    continue
+                
+                # ✅ HAYALET POZİSYON KONTROLÜ - Retry mechanism ile
+                normalized_position_symbol = self.normalize_symbol(position.symbol)
+                if normalized_position_symbol not in active_symbols_on_api:
+                    logger.info(f"🔄 [{position.symbol}] API'de bulunamadı, retry ile kontrol ediliyor...")
+                    
+                    # Retry mechanism ile tekrar kontrol et
+                    retry_position = await self.check_position_with_retry(position.symbol, max_retries=3, delay=3)
+                    
+                    if retry_position:
+                        logger.info(f"✅ [{position.symbol}] Retry sonrası bulundu, phantom değil")
+                        continue
+                    
+                    logger.info(f"🔄 [{position.symbol}] Retry sonrası da bulunamadı, hayalet pozisyon temizleniyor")
                     
                     # Son fiyatı al ve PnL hesapla
                     current_price = await self.get_current_price(position.symbol)
