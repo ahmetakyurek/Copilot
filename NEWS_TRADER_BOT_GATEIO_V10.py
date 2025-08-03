@@ -349,6 +349,8 @@ class Position:
     lowest_price_seen: float = float('inf')
     sl_order_id: Optional[str] = None
     tp_order_id: Optional[str] = None
+    created_timestamp: Optional[datetime] = None  # For grace period tracking
+    opening_order_id: Optional[str] = None  # For order verification
     news_item: Optional[NewsItem] = None
 
 # --- CONFIG MANAGER ---
@@ -546,11 +548,13 @@ class CsvLogger:
                 
                 pnl_percent = (position.pnl / (position.entry_price * position.size)) * 100 if position.entry_price * position.size != 0 else 0
 
-                # Eğer haber bilgisi yoksa varsayılan değerler kullan
-                news_source = news_item.source if news_item else "N/A"
-                news_title = news_item.title.replace(",", ";") if news_item else "N/A" # Virgülleri değiştir
-                sentiment = news_item.sentiment_score if news_item else 0.0
-                impact = news_item.impact_level if news_item else "N/A"
+                # Safe handling of news_item attributes
+                news_source = getattr(news_item, 'source', 'N/A') if news_item else 'N/A'
+                news_title = getattr(news_item, 'title', 'N/A') if news_item else 'N/A'
+                if news_title != 'N/A':
+                    news_title = news_title.replace(",", ";")  # Replace commas for CSV
+                sentiment = getattr(news_item, 'sentiment_score', 0.0) if news_item else 0.0
+                impact = getattr(news_item, 'impact_level', 'N/A') if news_item else 'N/A'
                 
                 row = [
                     now_utc.strftime("%Y-%m-%d %H:%M:%S"),
@@ -577,6 +581,30 @@ class CsvLogger:
 
             except Exception as e:
                 logger.error(f"CSV'ye işlem kaydı sırasında hata: {e}")
+                # Fallback: log essential info only
+                try:
+                    self.log_error_to_csv(position, reason, str(e))
+                except:
+                    pass  # Silent fail for logging errors
+
+    def log_error_to_csv(self, position: Position, reason: str, error: str):
+        """Fallback logging method for when regular logging fails"""
+        try:
+            fallback_data = {
+                'symbol': str(position.symbol) if hasattr(position, 'symbol') else 'UNKNOWN',
+                'side': str(position.side) if hasattr(position, 'side') else 'UNKNOWN',
+                'error': str(error),
+                'reason': str(reason),
+                'timestamp': datetime.utcnow().isoformat()
+            }
+            
+            with open('trade_errors.csv', 'a', newline='', encoding='utf-8') as f:
+                if not hasattr(self, '_error_header_written'):
+                    f.write("timestamp,symbol,side,reason,error\n")
+                    self._error_header_written = True
+                f.write(f"{fallback_data['timestamp']},{fallback_data['symbol']},{fallback_data['side']},{fallback_data['reason']},{fallback_data['error']}\n")
+        except:
+            pass  # Silent fail for error logging
 
 class PaperTradingEngine:
     def __init__(self, bot_instance, initial_balance: float = 10000):
@@ -611,12 +639,14 @@ class PaperTradingEngine:
                 logger.warning(f"[{coin_symbol}] Hesaplanan pozisyon büyüklüğü çok küçük. İşlem atlanıyor.")
                 return None
             
+            current_time = datetime.utcnow()
             position = Position(
                 symbol=full_symbol, exchange="paper", side=signal.action,
                 size=position_size, entry_price=current_price, current_price=current_price,
                 stop_loss=signal.stop_loss, take_profit=signal.take_profit, pnl=0.0,
-                timestamp=datetime.now(), news_item=news_item, volatility=signal.volatility,
-                trailing_stop=signal.stop_loss, highest_price_seen=current_price, lowest_price_seen=current_price
+                timestamp=current_time, news_item=news_item, volatility=signal.volatility,
+                trailing_stop=signal.stop_loss, highest_price_seen=current_price, lowest_price_seen=current_price,
+                created_timestamp=current_time, opening_order_id=None  # Paper trading doesn't have real orders
             )
             
             self.positions[coin_symbol] = position
@@ -2697,6 +2727,22 @@ class CryptoNewsBot:
                 logger.warning(f"[{symbol}] Pozisyon büyüklüğü sıfır veya negatif. İşlem iptal.")
                 return
 
+            # ✅ MARGIN VALIDATION BEFORE TRADE
+            margin_valid, margin_message = await self.validate_margin_before_trade(symbol, amount, signal.entry_price)
+            if not margin_valid:
+                logger.error(f"❌ [{symbol}] Margin validation failed: {margin_message}")
+                await self.telegram.send_message(f"💸 <b>Margin Error</b>\n<b>Coin:</b> {symbol}\n<b>Reason:</b> {margin_message}")
+                
+                # Try with reduced position size (50% of original)
+                reduced_amount = amount * 0.5
+                margin_valid_reduced, margin_message_reduced = await self.validate_margin_before_trade(symbol, reduced_amount, signal.entry_price)
+                if margin_valid_reduced:
+                    logger.info(f"✅ [{symbol}] Using reduced position size: {reduced_amount}")
+                    amount = reduced_amount
+                else:
+                    logger.error(f"❌ [{symbol}] Even reduced position size fails margin check. Skipping trade.")
+                    return
+
             # ANA PİYASA EMRİNİ GÖNDER
             logger.info(f"[{symbol}] Ana piyasa emri gönderiliyor: {amount} kontrat")
             
@@ -2754,12 +2800,14 @@ class CryptoNewsBot:
                 logger.warning(f"⚠️ [{symbol}] API Stop Loss başarısız, manuel takip devrede")
             
             # Pozisyonu her durumda kaydet (manuel takip varken acil kapatma yok)
+            current_time = datetime.utcnow()
             position = Position(
                 symbol=symbol, side=signal.action, size=filled_amount, entry_price=entry_price,
                 current_price=entry_price, stop_loss=signal.stop_loss, take_profit=signal.take_profit,
-                pnl=0.0, timestamp=datetime.now(), exchange=self.exchange.id, volatility=signal.volatility,
+                pnl=0.0, timestamp=current_time, exchange=self.exchange.id, volatility=signal.volatility,
                 sl_order_id=sl_order_id, tp_order_id=tp_order_id, news_item=news_item,
-                highest_price_seen=entry_price, lowest_price_seen=entry_price, trailing_stop=signal.stop_loss
+                highest_price_seen=entry_price, lowest_price_seen=entry_price, trailing_stop=signal.stop_loss,
+                created_timestamp=current_time, opening_order_id=order.get('id')
             )
             # ✅ DATABASE'E KAYDET
             if self.database:
@@ -2777,7 +2825,7 @@ class CryptoNewsBot:
             logger.error(f"❌ [{symbol}] setup_position_protections hatası: {e}")
 
     async def update_live_positions(self):
-        """Açık pozisyonları yönetir ve hayalet pozisyonları temizler."""
+        """Açık pozisyonları yönetir ve hayalet pozisyonları temizler - 180 saniye grace period ile."""
         if not self.live_positions: 
             return
         
@@ -2794,9 +2842,32 @@ class CryptoNewsBot:
             # Kapatılan pozisyonları tespit et
             for position_key, position in list(self.live_positions.items()):
                 
-                # ✅ HAYALET POZİSYON KONTROLÜ
+                # ✅ ENHANCED PHANTOM POSITION CHECK WITH GRACE PERIOD
                 if position.symbol not in active_symbols_on_api:
-                    logger.info(f"🔄 [{position.symbol}] API'de bulunamadı, hayalet pozisyon temizleniyor")
+                    # Check if grace period has passed (180 seconds = 3 minutes)
+                    position_age = (datetime.utcnow() - position.created_timestamp).total_seconds() if position.created_timestamp else 0
+                    grace_period = 180  # 3 minutes
+                    
+                    if position_age < grace_period:
+                        logger.info(f"🕐 [{position.symbol}] Position not found in API but within grace period ({position_age:.0f}s < {grace_period}s)")
+                        
+                        # Try robust verification with exponential backoff
+                        position_exists, verification_result = await self.check_position_with_strong_retry(
+                            position.symbol, 
+                            position.opening_order_id
+                        )
+                        
+                        if position_exists:
+                            logger.info(f"✅ [{position.symbol}] Position verified after retry: {verification_result}")
+                            continue
+                        else:
+                            logger.warning(f"⚠️ [{position.symbol}] Position not confirmed after retries: {verification_result}")
+                            # Continue to phantom position cleanup only if verification failed
+                    else:
+                        logger.info(f"⏰ [{position.symbol}] Grace period expired ({position_age:.0f}s >= {grace_period}s)")
+                    
+                    # Phantom position cleanup
+                    logger.info(f"🔄 [{position.symbol}] Removing phantom position")
                     
                     # Son fiyatı al ve PnL hesapla
                     current_price = await self.get_current_price(position.symbol)
@@ -2809,10 +2880,10 @@ class CryptoNewsBot:
                     
                     # Pozisyonu kaldır ve bildir
                     del self.live_positions[position_key]
-                    await self.telegram.notify_trade_closed(position, "MANUEL_KAPATMA_TESPİT_EDİLDİ")
-                    await self.csv_logger.log_trade(position, "MANUEL_KAPATMA", position.news_item)
+                    await self.telegram.notify_trade_closed(position, "PHANTOM_POSITION_CLEANUP")
+                    await self.csv_logger.log_trade(position, "PHANTOM_POSITION_CLEANUP", position.news_item)
                     
-                    logger.info(f"✅ [{position.symbol}] Hayalet pozisyon temizlendi ve bildirildi")
+                    logger.info(f"✅ [{position.symbol}] Phantom position cleaned up and logged")
                     continue
 
                 # Normal pozisyon güncellemesi
@@ -2987,6 +3058,27 @@ class CryptoNewsBot:
             logger.error(f"Bakiye alınamadı: {e}")
             return None
 
+    async def validate_margin_before_trade(self, symbol: str, position_size: float, price: float) -> Tuple[bool, str]:
+        """Validate sufficient margin before opening position"""
+        try:
+            balance = await self.get_futures_balance()
+            if balance is None:
+                logger.warning(f"Margin validation failed: Could not get balance for {symbol}")
+                return False, "Could not get balance"
+            
+            free_usdt = balance
+            
+            required_margin = position_size * price * 0.1  # 10% margin requirement
+            
+            if free_usdt < required_margin:
+                logger.warning(f"Insufficient margin for {symbol}: Need {required_margin:.2f} USDT, Have {free_usdt:.2f} USDT")
+                return False, f"Insufficient margin"
+                
+            return True, "Margin OK"
+        except Exception as e:
+            logger.error(f"Margin check failed for {symbol}: {e}")
+            return False, f"Margin check error: {e}"
+
     async def get_market_data(self, symbol: str) -> Optional[Tuple[float, List]]:
         try:
             async with self.exchange_api_semaphore:
@@ -3065,6 +3157,51 @@ class CryptoNewsBot:
             ticker = await self.loop.run_in_executor(None, lambda: self.exchange.fetch_ticker(symbol))
             return ticker.get('last')
         except Exception: return None
+
+    async def check_order_status(self, order_id: str, symbol: str) -> Optional[dict]:
+        """Check order status by order ID"""
+        try:
+            async with self.exchange_api_semaphore:
+                order = await self.loop.run_in_executor(None, lambda: self.exchange.fetch_order(order_id, symbol))
+            return order
+        except Exception as e:
+            logger.warning(f"Could not fetch order {order_id} for {symbol}: {e}")
+            return None
+
+    async def check_position_with_strong_retry(self, symbol: str, order_id: Optional[str] = None, max_retries: int = 5) -> Tuple[bool, str]:
+        """Enhanced position checking with exponential backoff and order ID verification"""
+        for attempt in range(max_retries):
+            try:
+                # Check positions via API
+                params = {}
+                if self.exchange.id == 'gateio': 
+                    params = {'settle': 'usdt'}
+                
+                positions = await self.loop.run_in_executor(None, lambda: self.exchange.fetch_positions([], params))
+                position_exists = any(float(pos.get('contracts', 0)) > 0 and pos['symbol'] == symbol for pos in positions)
+                
+                # If order_id provided, also check order history
+                if order_id:
+                    order_status = await self.check_order_status(order_id, symbol)
+                    if order_status and order_status.get('status') == 'closed':
+                        logger.info(f"Position confirmed via order {order_id} for {symbol}")
+                        return True, "Position confirmed via order"
+                
+                if position_exists:
+                    logger.info(f"Position found for {symbol} on attempt {attempt + 1}")
+                    return True, "Position found"
+                    
+            except Exception as e:
+                logger.warning(f"Position check attempt {attempt + 1} failed for {symbol}: {e}")
+            
+            # Exponential backoff: 2^attempt seconds
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.info(f"Waiting {wait_time}s before retry for {symbol}...")
+                await asyncio.sleep(wait_time)
+        
+        logger.warning(f"Position not found for {symbol} after {max_retries} retries")
+        return False, "Position not found after all retries"
 
     async def force_update_coin_list(self):
         """Coin listesini zorla güncelle"""
@@ -3323,12 +3460,14 @@ class CryptoNewsBot:
             # Stop-loss ayarlanamadıysa bile pozisyonu kaydetmeliyiz ki yönetebilelim.
 
         # 3. Başarılı Position Nesnesini Oluştur ve Döndür
+        current_time = datetime.utcnow()
         position = Position(
             symbol=symbol, side=signal.action, size=filled_amount, entry_price=entry_price,
             current_price=entry_price, stop_loss=signal.stop_loss, take_profit=signal.take_profit,
-            pnl=0.0, timestamp=datetime.now(), exchange=exchange_id, volatility=signal.volatility,
+            pnl=0.0, timestamp=current_time, exchange=exchange_id, volatility=signal.volatility,
             trailing_stop=signal.stop_loss, highest_price_seen=entry_price, lowest_price_seen=entry_price,
-            sl_order_id=sl_order_id, tp_order_id=tp_order_id
+            sl_order_id=sl_order_id, tp_order_id=tp_order_id,
+            created_timestamp=current_time, opening_order_id=order['id']
         )
         await self.telegram.notify_live_trade_opened(position, signal, news_title)
         return position
