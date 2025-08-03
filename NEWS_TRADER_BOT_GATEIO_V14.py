@@ -129,10 +129,27 @@ class TradingDatabase:
             logger.error(f"❌ Database başlatma hatası: {e}")
 
     def save_trade(self, position, news_item=None):
-        """Yeni trade'i database'e kaydeder."""
+        """Yeni trade'i database'e kaydeder - Enhanced data type checking."""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
+                
+                # Enhanced data type validation for news_item
+                news_source = None
+                news_title = None
+                sentiment_score = None
+                impact_level = None
+                
+                if news_item:
+                    # Check if news_item is a proper NewsItem object, not a string
+                    if hasattr(news_item, 'source'):
+                        news_source = news_item.source
+                    if hasattr(news_item, 'title'):
+                        news_title = news_item.title
+                    if hasattr(news_item, 'sentiment_score'):
+                        sentiment_score = news_item.sentiment_score
+                    if hasattr(news_item, 'impact_level'):
+                        impact_level = news_item.impact_level
                 
                 cursor.execute('''
                     INSERT INTO trades (
@@ -145,10 +162,10 @@ class TradingDatabase:
                     position.symbol, position.side, position.entry_price,
                     position.size, position.timestamp.isoformat(),
                     position.exchange,
-                    news_item.source if news_item else None,
-                    news_item.title if news_item else None,
-                    news_item.sentiment_score if news_item else None,
-                    news_item.impact_level if news_item else None,
+                    news_source,
+                    news_title,
+                    sentiment_score,
+                    impact_level,
                     position.volatility, position.stop_loss, position.take_profit,
                     getattr(position, 'confidence', 1.0), 'OPEN', 'ahmetakyurek'
                 ))
@@ -548,11 +565,16 @@ class CsvLogger:
                 
                 pnl_percent = (position.pnl / (position.entry_price * position.size)) * 100 if position.entry_price * position.size != 0 else 0
 
-                # Safe handling of news_item attributes
+                # Safe handling of news_item attributes with enhanced type checking
                 news_source = getattr(news_item, 'source', 'N/A') if news_item else 'N/A'
                 news_title = getattr(news_item, 'title', 'N/A') if news_item else 'N/A'
-                if news_title != 'N/A':
-                    news_title = news_title.replace(",", ";")  # Replace commas for CSV
+                
+                # Enhanced string validation and replacement
+                if news_title != 'N/A' and hasattr(news_title, 'replace'):
+                    news_title = str(news_title).replace(",", ";")  # Ensure string type before replace
+                elif news_title != 'N/A':
+                    news_title = str(news_title)  # Convert to string if not already
+                    
                 sentiment = getattr(news_item, 'sentiment_score', 0.0) if news_item else 0.0
                 impact = getattr(news_item, 'impact_level', 'N/A') if news_item else 'N/A'
                 
@@ -2721,13 +2743,20 @@ class CryptoNewsBot:
         try:
             logger.info(f"--- CANLI İŞLEM BAŞLATILIYOR (V5 Mantığı): {signal.action} {symbol} ---")
             
+            # ✅ CHECK FOR EXISTING POSITIONS FIRST - Fix LIQUIDATE_IMMEDIATELY error
+            existing_positions = await self.get_open_positions()
+            if symbol in existing_positions:
+                logger.warning(f"⚠️ [{symbol}] Mevcut pozisyon tespit edildi, kapatılıyor...")
+                await self.close_position(symbol)
+                await asyncio.sleep(2)  # API delay
+            
             # Pozisyon büyüklüğünü V10'daki dinamik fonksiyonla hesapla
             amount = await self.calculate_live_position_size(symbol, signal.entry_price, signal.stop_loss)
             if not amount or amount <= 0:
                 logger.warning(f"[{symbol}] Pozisyon büyüklüğü sıfır veya negatif. İşlem iptal.")
                 return
 
-            # ✅ MARGIN VALIDATION BEFORE TRADE
+            # ✅ ENHANCED MARGIN VALIDATION BEFORE TRADE
             margin_valid, margin_message = await self.validate_margin_before_trade(symbol, amount, signal.entry_price)
             if not margin_valid:
                 logger.error(f"❌ [{symbol}] Margin validation failed: {margin_message}")
@@ -2842,27 +2871,34 @@ class CryptoNewsBot:
             # Kapatılan pozisyonları tespit et
             for position_key, position in list(self.live_positions.items()):
                 
-                # ✅ ENHANCED PHANTOM POSITION CHECK WITH GRACE PERIOD
+                # ✅ OPTIMIZED PHANTOM POSITION CHECK WITH GRACE PERIOD
                 if position.symbol not in active_symbols_on_api:
                     # Check if grace period has passed (180 seconds = 3 minutes)
                     position_age = (datetime.utcnow() - position.created_timestamp).total_seconds() if position.created_timestamp else 0
                     grace_period = 180  # 3 minutes
                     
                     if position_age < grace_period:
-                        logger.info(f"🕐 [{position.symbol}] Position not found in API but within grace period ({position_age:.0f}s < {grace_period}s)")
+                        # Add throttling to prevent excessive logging - only log every 30 seconds
+                        if not hasattr(position, 'last_grace_log') or (datetime.utcnow() - position.last_grace_log).total_seconds() > 30:
+                            logger.info(f"🕐 [{position.symbol}] Position not found in API but within grace period ({position_age:.0f}s < {grace_period}s)")
+                            position.last_grace_log = datetime.utcnow()
                         
-                        # Try robust verification with exponential backoff
-                        position_exists, verification_result = await self.check_position_with_strong_retry(
-                            position.symbol, 
-                            position.opening_order_id
-                        )
+                        # Only retry verification once per grace period to avoid excessive API calls
+                        if not hasattr(position, 'verification_attempted'):
+                            position_exists, verification_result = await self.check_position_with_strong_retry(
+                                position.symbol, 
+                                position.opening_order_id
+                            )
+                            position.verification_attempted = True
+                            
+                            if position_exists:
+                                logger.info(f"✅ [{position.symbol}] Position verified after retry: {verification_result}")
+                                continue
+                            else:
+                                logger.warning(f"⚠️ [{position.symbol}] Position not confirmed after retries: {verification_result}")
                         
-                        if position_exists:
-                            logger.info(f"✅ [{position.symbol}] Position verified after retry: {verification_result}")
-                            continue
-                        else:
-                            logger.warning(f"⚠️ [{position.symbol}] Position not confirmed after retries: {verification_result}")
-                            # Continue to phantom position cleanup only if verification failed
+                        # Skip cleanup during grace period if already verified or attempted
+                        continue
                     else:
                         logger.info(f"⏰ [{position.symbol}] Grace period expired ({position_age:.0f}s >= {grace_period}s)")
                     
@@ -3058,25 +3094,76 @@ class CryptoNewsBot:
             logger.error(f"Bakiye alınamadı: {e}")
             return None
 
+    async def get_open_positions(self) -> set:
+        """Get currently open positions from exchange API"""
+        try:
+            params = {}
+            if self.exchange.id == 'gateio': 
+                params = {'settle': 'usdt'}
+            
+            positions_from_api = await self.loop.run_in_executor(None, lambda: self.exchange.fetch_positions([], params))
+            open_symbols = {pos['symbol'] for pos in positions_from_api if float(pos.get('contracts', 0)) > 0}
+            return open_symbols
+        except Exception as e:
+            logger.error(f"❌ Açık pozisyonlar alınamadı: {e}")
+            return set()
+
+    async def close_position(self, symbol: str):
+        """Close existing position if any"""
+        try:
+            # Get current positions
+            params = {}
+            if self.exchange.id == 'gateio': 
+                params = {'settle': 'usdt'}
+            
+            positions = await self.loop.run_in_executor(None, lambda: self.exchange.fetch_positions([symbol], params))
+            
+            for position in positions:
+                contracts = float(position.get('contracts', 0))
+                if contracts > 0:
+                    side = position['side']
+                    close_side = 'sell' if side == 'long' else 'buy'
+                    
+                    # Close the position
+                    close_params = {'settle': 'usdt', 'reduceOnly': True} if self.exchange.id == 'gateio' else {'reduceOnly': True}
+                    
+                    await self.loop.run_in_executor(
+                        None,
+                        lambda: self.exchange.create_market_order(symbol, close_side, contracts, params=close_params)
+                    )
+                    
+                    logger.info(f"✅ [{symbol}] Mevcut pozisyon kapatıldı: {contracts} kontrat")
+                    
+        except Exception as e:
+            logger.error(f"❌ [{symbol}] Pozisyon kapatma hatası: {e}")
+
     async def validate_margin_before_trade(self, symbol: str, position_size: float, price: float) -> Tuple[bool, str]:
-        """Validate sufficient margin before opening position"""
+        """Enhanced margin validation to prevent INSUFFICIENT_AVAILABLE errors"""
         try:
             balance = await self.get_futures_balance()
             if balance is None:
-                logger.warning(f"Margin validation failed: Could not get balance for {symbol}")
+                logger.warning(f"❌ [{symbol}] Trade cancelled: Bakiye alınamadı")
                 return False, "Could not get balance"
             
-            free_usdt = balance
+            # Position değerini hesapla
+            position_value = position_size * price
+            required_margin = position_value * 0.1  # %10 margin requirement
             
-            required_margin = position_size * price * 0.1  # 10% margin requirement
-            
-            if free_usdt < required_margin:
-                logger.warning(f"Insufficient margin for {symbol}: Need {required_margin:.2f} USDT, Have {free_usdt:.2f} USDT")
-                return False, f"Insufficient margin"
+            if balance < required_margin:
+                logger.warning(f"💸 [{symbol}] Yetersiz bakiye: margin {required_margin:.2f} while available {balance:.2f}")
+                return False, f"Insufficient margin. Required: ${required_margin:.2f}, Available: ${balance:.2f}"
                 
+            # Additional safety check: ensure we don't use more than 90% of available balance
+            max_safe_margin = balance * 0.9
+            if required_margin > max_safe_margin:
+                logger.warning(f"⚠️ [{symbol}] Required margin exceeds 90% of balance, reducing position size")
+                return False, f"Margin requirement too high for safe trading"
+                
+            logger.info(f"✅ [{symbol}] Margin validation passed: Required ${required_margin:.2f}, Available ${balance:.2f}")
             return True, "Margin OK"
+            
         except Exception as e:
-            logger.error(f"Margin check failed for {symbol}: {e}")
+            logger.error(f"❌ [{symbol}] Margin check failed: {e}")
             return False, f"Margin check error: {e}"
 
     async def get_market_data(self, symbol: str) -> Optional[Tuple[float, List]]:
