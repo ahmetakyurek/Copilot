@@ -339,6 +339,10 @@ class TradingConfig:
         # ===== CACHE & HISTORY SETTINGS =====
         self.MAX_TRADE_HISTORY_SIZE = int(os.getenv('MAX_TRADE_HISTORY_SIZE', '1000'))
         self.MODEL_CACHE_MAX_AGE_HOURS = int(os.getenv('MODEL_CACHE_MAX_AGE_HOURS', '2'))
+        
+        # ===== FR RESET SETTINGS =====
+        self.FR_RESET_DELAY_MINUTES = int(os.getenv('FR_RESET_DELAY_MINUTES', '20'))
+        self.ENABLE_FR_RESET_COOLDOWN = bool(os.getenv('ENABLE_FR_RESET_COOLDOWN', 'True').lower() in ['true', '1', 't', 'y', 'yes'])
     
     def set_value(self, key: str, value_str: str) -> bool:
         """Set configuration value dynamically"""
@@ -358,6 +362,44 @@ class TradingConfig:
                 return False
         return False
 
+    def validate_config(self):
+        """Startup'ta config'i validate et"""
+        validation_errors = []
+        
+        # FR threshold validation
+        if self.FR_LONG_THRESHOLD > 0:
+            validation_errors.append("FR_LONG_THRESHOLD should be negative (current: {})".format(self.FR_LONG_THRESHOLD))
+        
+        # AI confidence validation
+        if self.AI_CONFIDENCE_THRESHOLD > 1:
+            validation_errors.append("AI_CONFIDENCE_THRESHOLD should be <= 1 (current: {})".format(self.AI_CONFIDENCE_THRESHOLD))
+        
+        if self.AI_CONFIDENCE_THRESHOLD < 0.3:
+            validation_errors.append("AI_CONFIDENCE_THRESHOLD too low, should be >= 0.3 (current: {})".format(self.AI_CONFIDENCE_THRESHOLD))
+        
+        # Risk management validation
+        if self.MAX_RISK_PER_TRADE <= 0 or self.MAX_RISK_PER_TRADE > 0.2:
+            validation_errors.append("MAX_RISK_PER_TRADE should be between 0 and 0.2 (current: {})".format(self.MAX_RISK_PER_TRADE))
+        
+        # Position limit validation
+        if self.MAX_ACTIVE_TRADES <= 0 or self.MAX_ACTIVE_TRADES > 20:
+            validation_errors.append("MAX_ACTIVE_TRADES should be between 1 and 20 (current: {})".format(self.MAX_ACTIVE_TRADES))
+        
+        # Memory validation
+        if self.MAX_MODEL_CACHE_SIZE <= 0:
+            validation_errors.append("MAX_MODEL_CACHE_SIZE should be > 0 (current: {})".format(self.MAX_MODEL_CACHE_SIZE))
+        
+        # FR reset validation
+        if self.FR_RESET_DELAY_MINUTES <= 0 or self.FR_RESET_DELAY_MINUTES > 60:
+            validation_errors.append("FR_RESET_DELAY_MINUTES should be between 1 and 60 (current: {})".format(self.FR_RESET_DELAY_MINUTES))
+        
+        if validation_errors:
+            error_msg = "Configuration validation failed:\n" + "\n".join(f"- {error}" for error in validation_errors)
+            logging.error(error_msg)
+            raise ValueError(error_msg)
+        else:
+            logging.info("✅ Configuration validation passed")
+
     def adjust_confidence_threshold(self, adjustment: float):
         """Adjust AI confidence threshold for auto-tuning"""
         current = config.AI_CONFIDENCE_THRESHOLD
@@ -367,6 +409,13 @@ class TradingConfig:
 
 # Initialize global configuration
 config = TradingConfig()
+
+# Validate configuration on startup
+try:
+    config.validate_config()
+except ValueError as e:
+    print(f"❌ Configuration Error: {e}")
+    sys.exit(1)
 
 # ===== EXCEPTION CLASSES =====
 class TradingError(Exception):
@@ -382,16 +431,53 @@ class MemoryError(TradingError):
     pass
 
 # ===== UTILITY CLASSES =====
-class APIRateLimiter:
-    """Rate limiter for API requests"""
+# ===== UTILITY CLASSES =====
+class SmartAPIRateLimiter:
+    """Smart Rate limiter with endpoint-specific delays"""
     
     def __init__(self, max_requests: int = 1000):
         self.max_requests = max_requests
         self.requests = []
         self.lock = asyncio.Lock()
+        
+        # Endpoint-specific rate limits (seconds)
+        self.endpoint_delays = {
+            '/fapi/v1/klines': 0.2,
+            '/fapi/v1/ticker/price': 0.05,
+            '/fapi/v1/premiumIndex': 0.1,
+            '/fapi/v1/ticker/24hr': 0.15,
+            '/fapi/v1/account': 0.3,
+            '/fapi/v1/positionRisk': 0.2,
+            '/fapi/v1/order': 0.1,
+            '/fapi/v1/depth': 0.1
+        }
+        
+        # Track last call time for each endpoint
+        self.last_endpoint_call = {}
+        
+        logging.info("Smart API Rate Limiter initialized with endpoint-specific delays")
+    
+    async def smart_rate_limiting(self, endpoint: str):
+        """Endpoint'e göre dynamic rate limiting"""
+        async with self.lock:
+            now = time.time()
+            
+            # Get endpoint-specific delay
+            delay = self.endpoint_delays.get(endpoint, 0.1)
+            
+            # Check last call time for this endpoint
+            last_call = self.last_endpoint_call.get(endpoint, 0)
+            time_since_last = now - last_call
+            
+            if time_since_last < delay:
+                sleep_time = delay - time_since_last
+                await asyncio.sleep(sleep_time)
+            
+            # Update last call time
+            self.last_endpoint_call[endpoint] = time.time()
     
     async def acquire(self):
-        """Acquire rate limit permission"""
+        """Acquire rate limit permission (original method for backwards compatibility)"""
         async with self.lock:
             now = time.time()
             self.requests = [r for r in self.requests if now - r < 60]
@@ -399,6 +485,9 @@ class APIRateLimiter:
                 sleep_time = 60 - (now - self.requests[0])
                 await asyncio.sleep(sleep_time)
             self.requests.append(time.time())
+
+# Backwards compatibility
+APIRateLimiter = SmartAPIRateLimiter
 
 class EnhancedMemoryManager:
     """
@@ -2310,6 +2399,136 @@ class AdvancedFeatureEngineer:
         )
         logging.info("AdvancedFeatureEngineer initialized with caching.")
 
+    async def parallel_feature_engineering(self, df: pd.DataFrame, funding_rate: float = 0.0) -> pd.DataFrame:
+        """Parallel feature engineering for improved performance"""
+        try:
+            # Define parallel tasks for different feature groups
+            tasks = [
+                self._calculate_technical_indicators_async(df.copy()),
+                self._calculate_volume_features_async(df.copy()),
+                self._calculate_momentum_features_async(df.copy()),
+                self._calculate_volatility_features_async(df.copy())
+            ]
+            
+            # Execute all feature calculations in parallel
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Start with base dataframe
+            combined_df = df.copy()
+            combined_df['fundingRate'] = funding_rate
+            
+            # Combine results, handling exceptions
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logging.warning(f"Feature group {i} failed: {result}")
+                    continue
+                    
+                if isinstance(result, pd.DataFrame) and not result.empty:
+                    # Merge features carefully
+                    for col in result.columns:
+                        if col not in combined_df.columns:
+                            combined_df[col] = result[col]
+            
+            return combined_df
+            
+        except Exception as e:
+            logging.error(f"Parallel feature engineering failed: {e}")
+            # Fallback to sequential
+            return await self.create_features(df, funding_rate)
+    
+    async def _calculate_technical_indicators_async(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate technical indicators asynchronously"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._calculate_technical_indicators_sync, df)
+    
+    async def _calculate_volume_features_async(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate volume features asynchronously"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._calculate_volume_features_sync, df)
+    
+    async def _calculate_momentum_features_async(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate momentum features asynchronously"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._calculate_momentum_features_sync, df)
+    
+    async def _calculate_volatility_features_async(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate volatility features asynchronously"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._calculate_volatility_features_sync, df)
+    
+    def _calculate_technical_indicators_sync(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Synchronous technical indicators calculation"""
+        try:
+            result_df = pd.DataFrame(index=df.index)
+            
+            # RSI
+            result_df['rsi'] = ta.rsi(df['close'], length=14)
+            
+            # MACD
+            macd = ta.macd(df['close'])
+            result_df['macd_diff'] = macd['MACDh_12_26_9']
+            
+            # Bollinger Bands
+            bb = ta.bbands(df['close'], length=20)
+            result_df['bb_width'] = (bb['BBU_20_2.0'] - bb['BBL_20_2.0']) / df['close']
+            
+            # ATR
+            result_df['atr_percent'] = ta.atr(df['high'], df['low'], df['close'], length=14) / df['close']
+            
+            return result_df.fillna(0)
+        except Exception as e:
+            logging.error(f"Technical indicators calculation failed: {e}")
+            return pd.DataFrame(index=df.index)
+    
+    def _calculate_volume_features_sync(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Synchronous volume features calculation"""
+        try:
+            result_df = pd.DataFrame(index=df.index)
+            
+            # Volume ratio to moving average
+            vol_ma = df['volume'].rolling(20).mean()
+            result_df['volume_ratio'] = df['volume'] / vol_ma
+            
+            # Volume momentum
+            for period in [5, 10]:
+                result_df[f'volume_momentum_{period}'] = df['volume'].pct_change(period)
+            
+            return result_df.fillna(0)
+        except Exception as e:
+            logging.error(f"Volume features calculation failed: {e}")
+            return pd.DataFrame(index=df.index)
+    
+    def _calculate_momentum_features_sync(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Synchronous momentum features calculation"""
+        try:
+            result_df = pd.DataFrame(index=df.index)
+            
+            # Price momentum
+            for period in self.momentum_periods:
+                result_df[f'momentum_{period}'] = df['close'].pct_change(period)
+                result_df[f'rsi_{period}'] = ta.rsi(df['close'], length=period)
+            
+            return result_df.fillna(0)
+        except Exception as e:
+            logging.error(f"Momentum features calculation failed: {e}")
+            return pd.DataFrame(index=df.index)
+    
+    def _calculate_volatility_features_sync(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Synchronous volatility features calculation"""
+        try:
+            result_df = pd.DataFrame(index=df.index)
+            
+            # Realized volatility
+            for window in self.volatility_windows:
+                returns = df['close'].pct_change()
+                result_df[f'realized_vol_{window}'] = returns.rolling(window).std()
+                result_df[f'hl_volatility_{window}'] = (df['high'] - df['low']).rolling(window).mean() / df['close']
+            
+            return result_df.fillna(0)
+        except Exception as e:
+            logging.error(f"Volatility features calculation failed: {e}")
+            return pd.DataFrame(index=df.index)
+
     @safe_dataframe_operations
     async def create_features(self, df: pd.DataFrame, funding_rate: float = 0.0) -> pd.DataFrame:
         cached_features = await self.feature_cache.get_features(df, funding_rate)
@@ -2520,33 +2739,8 @@ class AdvancedFeatureEngineer:
 
 # === NEURAL NETWORK PREDICTOR SINIFINI AdvancedFeatureEngineer'DAN SONRA EKLEYİN ===
 
-try:
-    import tensorflow as tf
-    print(f"✅ TensorFlow imported successfully: {tf.__version__}")
-    
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import Dense, Dropout, LSTM, BatchNormalization
-    from tensorflow.keras.optimizers import Adam
-    from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-    from tensorflow.keras.regularizers import l2
-    
-    TENSORFLOW_AVAILABLE = True
-    
-    # TensorFlow loglarını azalt
-    tf.get_logger().setLevel('ERROR')
-    
-    print("🧠 Neural Networks will be ENABLED")
-    logging.info(f"TensorFlow {tf.__version__} loaded successfully for Neural Networks")
-    
-except ImportError as e:
-    print(f"❌ TensorFlow ImportError: {e}")
-    TENSORFLOW_AVAILABLE = False
-    logging.warning(f"TensorFlow not available. ImportError: {e}")
-    
-except Exception as e:
-    print(f"❌ TensorFlow Exception: {e}")
-    TENSORFLOW_AVAILABLE = False
-    logging.warning(f"TensorFlow error: {e}")
+# TensorFlow imports are handled globally by initialize_tensorflow() function
+# Use the global TENSORFLOW_AVAILABLE variable and tf_module reference
 
 class NeuralNetworkPredictor:
     """TensorFlow ile Neural Network modelleri - daha akıllı predictions"""
@@ -2563,8 +2757,16 @@ class NeuralNetworkPredictor:
     
     def _create_dense_model(self, input_dim: int):  # Type hint kaldırıldı
         """Dense Neural Network modeli oluştur"""
-        if not TENSORFLOW_AVAILABLE:
+        if not TENSORFLOW_AVAILABLE or tf_module is None:
             raise ValueError("TensorFlow not available")
+            
+        # Use global tf_module reference
+        Sequential = tf_module.keras.models.Sequential
+        Dense = tf_module.keras.layers.Dense
+        BatchNormalization = tf_module.keras.layers.BatchNormalization
+        Dropout = tf_module.keras.layers.Dropout
+        Adam = tf_module.keras.optimizers.Adam
+        l2 = tf_module.keras.regularizers.l2
             
         model = Sequential([
             # Input layer
@@ -2594,8 +2796,16 @@ class NeuralNetworkPredictor:
     
     def _create_lstm_model(self, input_dim: int, sequence_length: int):  # Type hint kaldırıldı
         """LSTM modeli oluştur (sequential data için)"""
-        if not TENSORFLOW_AVAILABLE:
+        if not TENSORFLOW_AVAILABLE or tf_module is None:
             raise ValueError("TensorFlow not available")
+            
+        # Use global tf_module reference
+        Sequential = tf_module.keras.models.Sequential
+        LSTM = tf_module.keras.layers.LSTM
+        Dense = tf_module.keras.layers.Dense
+        BatchNormalization = tf_module.keras.layers.BatchNormalization
+        Dropout = tf_module.keras.layers.Dropout
+        Adam = tf_module.keras.optimizers.Adam
             
         model = Sequential([
             # LSTM layers
@@ -2638,7 +2848,7 @@ class NeuralNetworkPredictor:
     
     def fit(self, X: np.ndarray, y: np.ndarray):
         """Neural Network modellerini train et"""
-        if not TENSORFLOW_AVAILABLE:
+        if not TENSORFLOW_AVAILABLE or tf_module is None:
             raise ValueError("TensorFlow not available for Neural Network training")
         
         if len(X) < 100:  # NN için daha fazla data gerekir
@@ -2654,6 +2864,10 @@ class NeuralNetworkPredictor:
             split_idx = int(len(X) * 0.8)
             X_train, X_val = X[:split_idx], X[split_idx:]
             y_train, y_val = y[:split_idx], y[split_idx:]
+            
+            # Use global tf_module reference for callbacks
+            EarlyStopping = tf_module.keras.callbacks.EarlyStopping
+            ReduceLROnPlateau = tf_module.keras.callbacks.ReduceLROnPlateau
             
             # Callbacks
             early_stopping = EarlyStopping(
@@ -2846,6 +3060,393 @@ class NeuralNetworkPredictor:
             model_info['models'].append(info)
         
         return model_info
+
+# ===== FR RESET MANAGER =====
+class FRResetManager:
+    """
+    FR Reset sonrası bekleme logic'i yönetir.
+    FR reset sonrası genellikle ilk 15-20 dakika düşüş oluyor - bu süreyi bekler.
+    """
+    
+    def __init__(self, fr_reset_delay_minutes: int = 20):
+        self.fr_reset_delay_minutes = fr_reset_delay_minutes
+        self.last_fr_reset_time = None
+        self.is_in_fr_reset_cooldown = False
+        
+        # FR reset zamanları (UTC): 00:00, 08:00, 16:00
+        self.fr_reset_hours = [0, 8, 16]
+        
+        logging.info(f"FRResetManager initialized with {fr_reset_delay_minutes} minute delay")
+    
+    async def check_fr_reset_status(self) -> bool:
+        """FR reset sonrası bekleme durumunu kontrol et"""
+        try:
+            current_time = datetime.now(pytz.UTC)  # UTC timezone kullan
+            current_hour = current_time.hour
+            current_minute = current_time.minute
+            
+            # FR reset saatlerinden birinde miyiz?
+            if current_hour in self.fr_reset_hours:
+                # Reset zamanını hesapla (tam saat)
+                reset_time = current_time.replace(minute=0, second=0, microsecond=0)
+                
+                # Reset'ten bu yana geçen süre (dakika)
+                time_since_reset = (current_time - reset_time).total_seconds() / 60
+                
+                # Eğer reset'ten sonra belirlenen süre geçmemişse cooldown aktif
+                if 0 <= time_since_reset <= self.fr_reset_delay_minutes:
+                    self.is_in_fr_reset_cooldown = True
+                    self.last_fr_reset_time = reset_time
+                    return True
+            
+            self.is_in_fr_reset_cooldown = False
+            return False
+            
+        except Exception as e:
+            logging.error(f"Error checking FR reset status: {e}")
+            self.is_in_fr_reset_cooldown = False
+            return False
+    
+    async def should_skip_trading_due_to_fr_reset(self) -> bool:
+        """FR reset cooldown nedeniyle trading'i skip etmeli mi?"""
+        is_cooldown = await self.check_fr_reset_status()
+        
+        if is_cooldown:
+            remaining_time = self.get_remaining_cooldown_time()
+            logging.info(f"🔄 FR Reset cooldown aktif - Trading skip ediliyor. Kalan süre: {remaining_time:.1f} dakika")
+            return True
+            
+        return False
+    
+    def get_remaining_cooldown_time(self) -> float:
+        """Kalan cooldown süresini dakika olarak döndür"""
+        if not self.is_in_fr_reset_cooldown or not self.last_fr_reset_time:
+            return 0.0
+            
+        current_time = datetime.now(pytz.UTC)
+        elapsed_minutes = (current_time - self.last_fr_reset_time).total_seconds() / 60
+        remaining_minutes = max(0, self.fr_reset_delay_minutes - elapsed_minutes)
+        
+        return remaining_minutes
+    
+    def get_next_fr_reset_time(self) -> datetime:
+        """Bir sonraki FR reset zamanını döndür"""
+        current_time = datetime.now(pytz.UTC)
+        current_hour = current_time.hour
+        
+        # Bugün için kalan reset zamanlarını kontrol et
+        for reset_hour in self.fr_reset_hours:
+            if reset_hour > current_hour:
+                return current_time.replace(hour=reset_hour, minute=0, second=0, microsecond=0)
+        
+        # Bugün kalan reset yok, yarının ilk reset'i
+        next_day = current_time + timedelta(days=1)
+        return next_day.replace(hour=self.fr_reset_hours[0], minute=0, second=0, microsecond=0)
+    
+    def get_fr_reset_status_dict(self) -> Dict[str, Any]:
+        """FR reset durumu bilgilerini dict olarak döndür (dashboard için)"""
+        return {
+            'is_in_cooldown': self.is_in_fr_reset_cooldown,
+            'remaining_minutes': self.get_remaining_cooldown_time(),
+            'last_reset_time': self.last_fr_reset_time.isoformat() if self.last_fr_reset_time else None,
+            'next_reset_time': self.get_next_fr_reset_time().isoformat(),
+            'delay_minutes': self.fr_reset_delay_minutes
+        }
+
+# ===== REAL-TIME DASHBOARD =====
+class TradingDashboard:
+    """
+    Real-time dashboard for monitoring trading metrics
+    WebSocket-based streaming dashboard
+    """
+    
+    def __init__(self, bot_instance):
+        self.bot = bot_instance
+        self.dashboard_active = False
+        self.last_metrics = {}
+        self.websocket_clients = set()
+        
+        logging.info("Trading Dashboard initialized")
+    
+    def calculate_daily_pnl(self) -> float:
+        """Calculate daily P&L"""
+        try:
+            today = datetime.now(IST_TIMEZONE).date()
+            daily_trades = [
+                trade for trade in self.bot.trade_history 
+                if trade.get('entry_time') and 
+                datetime.fromisoformat(trade['entry_time']).date() == today
+            ]
+            
+            total_pnl = sum(trade.get('pnl_usd', 0) for trade in daily_trades)
+            return total_pnl
+        except Exception as e:
+            logging.error(f"Error calculating daily PnL: {e}")
+            return 0.0
+    
+    def get_avg_confidence(self) -> float:
+        """Get average AI confidence from recent signals"""
+        try:
+            # Get recent confidence scores from active positions
+            recent_confidences = []
+            for symbol, position in self.bot.active_positions.items():
+                if hasattr(position, 'confidence') and position.confidence:
+                    recent_confidences.append(position.confidence)
+            
+            if recent_confidences:
+                return sum(recent_confidences) / len(recent_confidences)
+            return 0.0
+        except Exception as e:
+            logging.error(f"Error calculating average confidence: {e}")
+            return 0.0
+    
+    async def get_real_time_metrics(self) -> Dict[str, Any]:
+        """Get current real-time metrics"""
+        try:
+            # Memory usage
+            memory_usage = self.bot.memory_manager.get_memory_usage() if hasattr(self.bot, 'memory_manager') else {}
+            
+            # FR reset status
+            fr_status = {}
+            if hasattr(self.bot, 'fr_reset_manager'):
+                fr_status = self.bot.fr_reset_manager.get_fr_reset_status_dict()
+            
+            # Current balance
+            balance = 0.0
+            if config.TRADING_MODE == TradingMode.LIVE:
+                balance = await self.bot.get_futures_balance() or 0.0
+            else:
+                balance = getattr(self.bot, 'paper_balance', 0.0)
+            
+            metrics = {
+                'timestamp': datetime.now(IST_TIMEZONE).isoformat(),
+                'active_positions': len(self.bot.active_positions),
+                'max_positions': config.MAX_ACTIVE_TRADES,
+                'daily_pnl': self.calculate_daily_pnl(),
+                'current_balance': balance,
+                'memory_usage_mb': memory_usage.get('rss_mb', 0),
+                'ai_confidence_avg': self.get_avg_confidence(),
+                'fr_reset_cooldown': fr_status.get('is_in_cooldown', False),
+                'fr_remaining_minutes': fr_status.get('remaining_minutes', 0),
+                'trading_mode': config.TRADING_MODE.value,
+                'system_health': 'healthy'  # Simplified for now
+            }
+            
+            self.last_metrics = metrics
+            return metrics
+            
+        except Exception as e:
+            logging.error(f"Error getting real-time metrics: {e}")
+            return self.last_metrics or {}
+    
+    async def stream_metrics_to_log(self, interval: int = 60):
+        """Stream metrics to log file for monitoring"""
+        while self.dashboard_active:
+            try:
+                metrics = await self.get_real_time_metrics()
+                
+                # Log formatted metrics
+                log_msg = (
+                    f"📊 DASHBOARD METRICS | "
+                    f"Positions: {metrics['active_positions']}/{metrics['max_positions']} | "
+                    f"Daily P&L: ${metrics['daily_pnl']:.2f} | "
+                    f"Balance: ${metrics['current_balance']:.2f} | "
+                    f"Memory: {metrics['memory_usage_mb']:.1f}MB | "
+                    f"AI Confidence: {metrics['ai_confidence_avg']:.2%} | "
+                    f"FR Cooldown: {'Yes' if metrics['fr_reset_cooldown'] else 'No'}"
+                )
+                
+                logging.info(log_msg)
+                
+                await asyncio.sleep(interval)
+                
+            except Exception as e:
+                logging.error(f"Dashboard streaming error: {e}")
+                await asyncio.sleep(30)  # Shorter sleep on error
+    
+    def start_dashboard(self):
+        """Start the dashboard monitoring"""
+        self.dashboard_active = True
+        logging.info("Real-time dashboard monitoring started")
+    
+    def stop_dashboard(self):
+        """Stop the dashboard monitoring"""
+        self.dashboard_active = False
+        logging.info("Real-time dashboard monitoring stopped")
+
+# ===== ML PIPELINE ORGANIZATION =====
+class MLPipeline:
+    """
+    Organized ML workflow for better model management
+    Centralizes feature store, model registry, and experiment tracking
+    """
+    
+    def __init__(self, bot_instance):
+        self.bot = bot_instance
+        self.feature_store = {}  # Simple feature store
+        self.model_registry = {}  # Model performance tracking
+        self.experiment_results = {}  # Experiment tracking
+        
+        logging.info("ML Pipeline initialized")
+    
+    async def prepare_training_data(self, symbol: str, days: int = 30) -> Optional[Tuple[pd.DataFrame, pd.Series]]:
+        """Prepare standardized training data for a symbol"""
+        try:
+            # Get recent trades for this symbol
+            recent_trades = await self.bot.db_manager.load_recent_trades(days)
+            symbol_trades = [t for t in recent_trades if t.get('symbol') == symbol]
+            
+            if len(symbol_trades) < 50:  # Need minimum samples
+                logging.warning(f"Insufficient training data for {symbol}: {len(symbol_trades)} samples")
+                return None
+            
+            # Get market data
+            klines = await self.bot._api_request_with_retry(
+                'GET', '/fapi/v1/klines', 
+                {'symbol': symbol, 'interval': '5m', 'limit': 500}
+            )
+            
+            if not klines:
+                return None
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(klines, columns=[
+                'open_time', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_volume', 'count', 'taker_buy_volume',
+                'taker_buy_quote_volume', 'ignore'
+            ])
+            
+            # Convert numeric columns
+            numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+            for col in numeric_cols:
+                df[col] = pd.to_numeric(df[col])
+            
+            # Generate features
+            features_df = await self.bot.feature_engineer.create_features(df)
+            
+            # Create labels from trade history
+            labels = self._create_labels_from_trades(features_df, symbol_trades)
+            
+            if len(labels) != len(features_df):
+                logging.warning(f"Feature-label mismatch for {symbol}")
+                return None
+            
+            return features_df, labels
+            
+        except Exception as e:
+            logging.error(f"Error preparing training data for {symbol}: {e}")
+            return None
+    
+    def _create_labels_from_trades(self, df: pd.DataFrame, trades: List[Dict]) -> pd.Series:
+        """Create binary labels from successful trades"""
+        labels = pd.Series(0, index=df.index)  # Default to 0 (no trade)
+        
+        for trade in trades:
+            if trade.get('pnl_usd', 0) > 0:  # Profitable trade
+                # Find approximate time in dataframe
+                # This is simplified - in practice you'd match timestamps more precisely
+                entry_time = trade.get('entry_time')
+                if entry_time and len(labels) > 10:
+                    # Mark last 10% of data as positive if trade was profitable
+                    start_idx = int(len(labels) * 0.9)
+                    labels.iloc[start_idx:] = 1
+                    break
+        
+        return labels
+    
+    async def train_and_evaluate(self, symbol: str) -> Dict[str, Any]:
+        """Train model and evaluate performance"""
+        try:
+            # Prepare data
+            data_result = await self.prepare_training_data(symbol)
+            if data_result is None:
+                return {'error': 'Failed to prepare training data'}
+            
+            features_df, labels = data_result
+            
+            # Use existing model training infrastructure
+            if hasattr(self.bot, 'model_cache'):
+                model_key = f"ml_pipeline_{symbol}"
+                
+                # Check if model exists in cache
+                cached_model = self.bot.model_cache.get_model(model_key)
+                if cached_model:
+                    # Evaluate existing model
+                    metrics = self._evaluate_model(cached_model, features_df, labels)
+                    self.model_registry[symbol] = metrics
+                    return metrics
+                else:
+                    # Train new model using existing ensemble predictor
+                    try:
+                        # Create ensemble predictor
+                        from sklearn.ensemble import RandomForestClassifier
+                        model = RandomForestClassifier(n_estimators=100, random_state=42)
+                        
+                        # Prepare data
+                        X = features_df.select_dtypes(include=[np.number]).fillna(0)
+                        y = labels
+                        
+                        # Train
+                        model.fit(X, y)
+                        
+                        # Store in cache
+                        self.bot.model_cache.store_model(model_key, model, X.shape[1])
+                        
+                        # Evaluate
+                        metrics = self._evaluate_model(model, X, y)
+                        self.model_registry[symbol] = metrics
+                        
+                        return metrics
+                        
+                    except Exception as train_error:
+                        logging.error(f"Model training failed for {symbol}: {train_error}")
+                        return {'error': f'Training failed: {train_error}'}
+            
+            return {'error': 'Model cache not available'}
+            
+        except Exception as e:
+            logging.error(f"ML pipeline training failed for {symbol}: {e}")
+            return {'error': str(e)}
+    
+    def _evaluate_model(self, model, X: pd.DataFrame, y: pd.Series) -> Dict[str, float]:
+        """Evaluate model performance"""
+        try:
+            # Simple train/test split
+            split_idx = int(len(X) * 0.8)
+            X_train, X_test = X[:split_idx], X[split_idx:]
+            y_train, y_test = y[:split_idx], y[split_idx:]
+            
+            # Predict
+            y_pred = model.predict(X_test)
+            
+            # Calculate metrics
+            accuracy = (y_pred == y_test).mean()
+            precision = precision_score(y_test, y_pred, zero_division=0)
+            
+            # Count positives
+            positive_rate = y_test.mean()
+            prediction_rate = y_pred.mean()
+            
+            return {
+                'accuracy': float(accuracy),
+                'precision': float(precision),
+                'positive_rate': float(positive_rate),
+                'prediction_rate': float(prediction_rate),
+                'sample_count': len(y_test)
+            }
+            
+        except Exception as e:
+            logging.error(f"Model evaluation failed: {e}")
+            return {'error': str(e)}
+    
+    def get_model_performance_summary(self) -> Dict[str, Any]:
+        """Get summary of all model performance"""
+        return {
+            'models_trained': len(self.model_registry),
+            'performance_by_symbol': self.model_registry,
+            'average_accuracy': np.mean([m.get('accuracy', 0) for m in self.model_registry.values() if 'accuracy' in m]),
+            'average_precision': np.mean([m.get('precision', 0) for m in self.model_registry.values() if 'precision' in m])
+        }
 
 class DynamicSLTPManager:
     """
@@ -3471,6 +4072,8 @@ class TelegramCommandHandler:
             '/circuits': self.cmd_circuits,
             '/shutdown': self.cmd_shutdown,
             '/ai': self.cmd_ai_status,
+            '/dashboard': self.cmd_dashboard,
+            '/ml': self.cmd_ml_pipeline,
             '/ai_details': self.cmd_ai_details,
             '/debug': self.cmd_debug,
             '/fr': self.cmd_fr,
@@ -3662,7 +4265,10 @@ class TelegramCommandHandler:
             "<code>/errors</code> - Recent errors\n\n"
             "<b>🧠 AI System:</b>\n"
             "<code>/ai</code> - AI models & features status\n"
-            "<code>/ai_details</code> - Detailed AI model info\n\n"
+            "<code>/ai_details</code> - Detailed AI model info\n"
+            "<code>/ml</code> - ML Pipeline status & performance\n\n"
+            "<b>📊 Monitoring:</b>\n"
+            "<code>/dashboard</code> - Toggle real-time dashboard\n\n"
             "<b>🚨 Error Recovery:</b>\n"
             "<code>/recovery</code> - Recovery system status\n"
             "<code>/emergency</code> - Emergency mode info\n"
@@ -3902,8 +4508,26 @@ class TelegramCommandHandler:
 
                 f"<b><u>CURRENT SETTINGS</u></b>\n"
                 f"► <b>FR Threshold:</b> {config.FR_LONG_THRESHOLD}%\n"
-                f"► <b>AI Confidence:</b> {config.AI_CONFIDENCE_THRESHOLD * 100:.0f}%"
+                f"► <b>AI Confidence:</b> {config.AI_CONFIDENCE_THRESHOLD * 100:.0f}%\n\n"
             )
+            
+            # ===== FR RESET STATUS EKLEME =====
+            if config.ENABLE_FR_RESET_COOLDOWN:
+                fr_status = self.bot.fr_reset_manager.get_fr_reset_status_dict()
+                if fr_status['is_in_cooldown']:
+                    fr_emoji = "🔄"
+                    message += (
+                        f"<b><u>FR RESET STATUS</u></b>\n"
+                        f"{fr_emoji} <b>Cooldown Active:</b> {fr_status['remaining_minutes']:.1f} min remaining\n"
+                        f"► <b>Trading paused</b> until FR reset cooldown ends\n\n"
+                    )
+                else:
+                    next_reset = datetime.fromisoformat(fr_status['next_reset_time'])
+                    message += (
+                        f"<b><u>FR RESET STATUS</u></b>\n"
+                        f"✅ <b>Trading Active</b>\n"
+                        f"► <b>Next Reset:</b> {next_reset.strftime('%H:%M UTC')}\n\n"
+                    )
             
             await self.bot.send_telegram(message)
             
@@ -4521,6 +5145,69 @@ class TelegramCommandHandler:
             logging.error(f"Error checking memory health: {e}")
             await self.bot.send_telegram(f"❌ Error checking memory health: {e}")
 
+    async def cmd_dashboard(self):
+        """Dashboard control command"""
+        try:
+            if self.bot.dashboard.dashboard_active:
+                self.bot.dashboard.stop_dashboard()
+                await self.bot.send_telegram("📊 <b>Dashboard monitoring stopped</b>")
+            else:
+                self.bot.dashboard.start_dashboard()
+                # Start background task for dashboard streaming
+                asyncio.create_task(self.bot.dashboard.stream_metrics_to_log())
+                
+                metrics = await self.bot.dashboard.get_real_time_metrics()
+                
+                message = (
+                    f"📊 <b>REAL-TIME DASHBOARD ACTIVE</b>\n\n"
+                    f"<b>Current Metrics:</b>\n"
+                    f"► <b>Positions:</b> {metrics['active_positions']}/{metrics['max_positions']}\n"
+                    f"► <b>Daily P&L:</b> ${metrics['daily_pnl']:,.2f}\n"
+                    f"► <b>Balance:</b> ${metrics['current_balance']:,.2f}\n"
+                    f"► <b>Memory:</b> {metrics['memory_usage_mb']:.1f}MB\n"
+                    f"► <b>AI Confidence:</b> {metrics['ai_confidence_avg']:.1%}\n"
+                    f"► <b>FR Cooldown:</b> {'Active' if metrics['fr_reset_cooldown'] else 'Inactive'}\n\n"
+                    f"<i>Dashboard metrics will be logged every minute.</i>"
+                )
+                
+                await self.bot.send_telegram(message)
+                
+        except Exception as e:
+            logging.error(f"Error with dashboard command: {e}")
+            await self.bot.send_telegram(f"❌ Dashboard error: {e}")
+
+    async def cmd_ml_pipeline(self):
+        """ML Pipeline management command"""
+        try:
+            performance_summary = self.bot.ml_pipeline.get_model_performance_summary()
+            
+            message = (
+                f"🤖 <b>ML PIPELINE STATUS</b>\n\n"
+                f"<b>Overview:</b>\n"
+                f"► <b>Models Trained:</b> {performance_summary['models_trained']}\n"
+                f"► <b>Avg Accuracy:</b> {performance_summary['average_accuracy']:.2%}\n"
+                f"► <b>Avg Precision:</b> {performance_summary['average_precision']:.2%}\n\n"
+            )
+            
+            if performance_summary['performance_by_symbol']:
+                message += "<b>Symbol Performance:</b>\n"
+                for symbol, metrics in list(performance_summary['performance_by_symbol'].items())[:5]:  # Show top 5
+                    if 'error' not in metrics:
+                        message += f"• <code>{symbol}</code>: {metrics.get('accuracy', 0):.1%} acc, {metrics.get('precision', 0):.1%} prec\n"
+                
+                if len(performance_summary['performance_by_symbol']) > 5:
+                    message += f"<i>... and {len(performance_summary['performance_by_symbol']) - 5} more</i>\n"
+            else:
+                message += "<i>No models trained yet</i>\n"
+            
+            message += f"\n<i>Use ML pipeline for organized model training and evaluation</i>"
+            
+            await self.bot.send_telegram(message)
+            
+        except Exception as e:
+            logging.error(f"Error with ML pipeline command: {e}")
+            await self.bot.send_telegram(f"❌ ML Pipeline error: {e}")
+
 
 # ===== MAIN TRADING CLASS (V13) =====
 class FRHunterV12:
@@ -4541,6 +5228,15 @@ class FRHunterV12:
         # Error recovery and emergency management
         self.error_recovery = ErrorRecoveryManager(self)
         logging.info("Error recovery system initialized")
+        # FR Reset Manager
+        self.fr_reset_manager = FRResetManager(config.FR_RESET_DELAY_MINUTES)
+        logging.info(f"FR Reset Manager initialized with {config.FR_RESET_DELAY_MINUTES} minute delay")
+        # Real-time Dashboard
+        self.dashboard = TradingDashboard(self)
+        logging.info("Real-time dashboard initialized")
+        # ML Pipeline
+        self.ml_pipeline = MLPipeline(self)
+        logging.info("ML Pipeline initialized")
         # ==========================================
 
         # Model kullanım takibi (LRU benzeri)
@@ -5217,19 +5913,8 @@ class FRHunterV12:
         # ===== HEALTH MONITORING =====
         self.health_monitor.record_metric('api_calls_total')
         
-        # ===== RATE LIMITING KONTROLLERİ =====
-        now = time.time()
-        if hasattr(self, '_api_last_call'):
-            time_since_last = now - self._api_last_call
-            min_interval = 0.1
-            if time_since_last < min_interval:
-                await asyncio.sleep(min_interval - time_since_last)
-        
-        self._api_last_call = time.time()
-        
-        # Klines için ekstra bekleme
-        if '/klines' in path:
-            await asyncio.sleep(0.2)
+        # ===== SMART RATE LIMITING =====
+        await self.rate_limiter.smart_rate_limiting(path)
         
         for attempt in range(max_retries):
             try:
@@ -6570,14 +7255,14 @@ class FRHunterV12:
                 start_time = time.time()
 
                 try:
-                    # ❌ GEÇİCİ: Emergency mode kontrollerini kapat
-                    """
+                    # ===== EMERGENCY MODE CONTROL (RESTORED) =====
                     # Emergency mode'daysa sadece temel işlemleri yap
                     if self.error_recovery.emergency_mode:
                         logging.info("Emergency mode active - limited operations only")
                         
-                        # Sadece pozisyon yönetimi yap
+                        # Sadece pozisyon yönetimi ve temel işlemler
                         await self.manage_active_positions()
+                        await self.poll_telegram_messages()  # Telegram mesajlarına yanıt ver
                         
                         # Emergency mode'dan çıkış kontrolü
                         if self.error_recovery.should_exit_emergency_mode():
@@ -6587,12 +7272,14 @@ class FRHunterV12:
                         await asyncio.sleep(60)
                         continue  # Normal operations'ları atla
                     
-                    # Emergency mode tetikleyicilerini kontrol et
-                    emergency_triggers = self.error_recovery.should_trigger_emergency()
-                    if any(emergency_triggers.values()):
-                        await self.error_recovery.activate_emergency_mode(emergency_triggers)
-                        continue  # Bu cycle'ı atla
-                    """
+                    # Emergency mode tetikleyicilerini kontrol et (basitleştirilmiş)
+                    try:
+                        emergency_triggers = self.error_recovery.should_trigger_emergency()
+                        if any(emergency_triggers.values()):
+                            await self.error_recovery.activate_emergency_mode(emergency_triggers)
+                            continue  # Bu cycle'ı atla
+                    except Exception as trigger_error:
+                        logging.warning(f"Emergency trigger check failed, skipping: {trigger_error}")
                             
                 except Exception as emergency_error:
                     logging.error(f"Emergency mode check failed: {emergency_error}")
@@ -6667,6 +7354,12 @@ class FRHunterV12:
         V36 - Signal Funnel Edition.
         Adayları en ucuzdan en pahalıya doğru filtreler ve her adımı loglar.
         """
+        # ===== FR RESET COOLDOWN KONTROLÜ =====
+        if config.ENABLE_FR_RESET_COOLDOWN:
+            should_skip = await self.fr_reset_manager.should_skip_trading_due_to_fr_reset()
+            if should_skip:
+                return  # FR reset cooldown aktif, trading'i skip et
+        
         if len(self.active_positions) >= config.MAX_ACTIVE_TRADES:
             logging.info(f"Max active trades ({config.MAX_ACTIVE_TRADES}) reached. Skipping scan.")
             return
@@ -6977,10 +7670,6 @@ class FRHunterV12:
         except Exception as e:
             logging.error(f"Model training wrapper failed for {symbol}: {e}", exc_info=True)
             return False
-
-    async def get_current_price(self, symbol: str) -> Optional[float]:
-        ticker = await self._api_request_with_retry('GET', '/fapi/v1/ticker/price', {'symbol': symbol})
-        return float(ticker['price']) if ticker and 'price' in ticker else None
 
     async def load_trade_history(self):
         """V15.4 - Gelişmiş Teşhis ve Güvenli Veri Yorumlama ile Trade History Yükleme"""
