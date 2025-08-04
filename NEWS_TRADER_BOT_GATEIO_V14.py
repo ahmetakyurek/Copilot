@@ -3136,7 +3136,7 @@ class CryptoNewsBot:
             return None
 
     async def calculate_required_margin(self, symbol, amount, price, leverage=None):
-        """Gerçek margin hesaplama - Gate.io API'sine uygun"""
+        """Gerçek margin hesaplama - Gate.io API'sine uygun (Ultra Conservative)"""
         try:
             # Market info al
             market = self.exchange.market(symbol)
@@ -3153,22 +3153,49 @@ class CryptoNewsBot:
                 except:
                     leverage = 10  # Varsayılan
             
-            # Gate.io için gerçek margin hesaplama
-            # Minimum margin + fees + buffer
+            # Gate.io için ULTRA konservatif margin hesaplama
+            # Gerçek testlerde $2.26 hesaplandığında $48.52 gerekti (21x fark)
+            # Bu nedenle çok daha konservatif yaklaşım gerekli
+            
+            # Base margin (normal hesaplama)
             base_margin = position_value / leverage
-            trading_fee = position_value * 0.0004  # %0.04 gate.io fee
-            buffer = base_margin * 0.1  # %10 safety buffer
             
-            total_required = base_margin + trading_fee + buffer
+            # Trading fees (hem açma hem kapama)
+            trading_fee = position_value * 0.001  # %0.1 (konservatif)
             
-            logger.info(f"💰 [{symbol}] Margin detayı: Position=${position_value:.2f}, Base=${base_margin:.2f}, Fee=${trading_fee:.2f}, Total=${total_required:.2f}")
+            # Gate.io'ya özel ekstra margin gereksinimleri
+            volatility_buffer = position_value * 0.08  # %8 volatilite buffer
+            maintenance_margin = position_value * 0.05  # %5 maintenance margin
+            liquidation_buffer = position_value * 0.05  # %5 liquidation buffer
+            funding_rate_buffer = position_value * 0.02  # %2 funding rate buffer
+            
+            # Ultra conservative safety buffer - Gate.io çok daha fazla istiyor
+            safety_multiplier = 4.0  # 4x ekstra güvenlik (gerçek dünya deneyimi)
+            
+            # Toplam hesaplama
+            basic_total = base_margin + trading_fee + volatility_buffer + maintenance_margin + liquidation_buffer + funding_rate_buffer
+            total_required = basic_total * safety_multiplier
+            
+            # Minimum margin requirement (Gate.io gerçek deneyimi)
+            min_margin_requirement = position_value * 0.25  # En az %25
+            total_required = max(total_required, min_margin_requirement)
+            
+            logger.info(f"💰 [{symbol}] Ultra Konservatif Margin:")
+            logger.info(f"    Position=${position_value:.2f}, Base=${base_margin:.2f}")
+            logger.info(f"    Fees=${trading_fee:.2f}, Volatility=${volatility_buffer:.2f}")
+            logger.info(f"    Maintenance=${maintenance_margin:.2f}, Liquidation=${liquidation_buffer:.2f}")
+            logger.info(f"    Funding=${funding_rate_buffer:.2f}, Basic=${basic_total:.2f}")
+            logger.info(f"    Multiplied=${basic_total * safety_multiplier:.2f}, MinReq=${min_margin_requirement:.2f}")
+            logger.info(f"    FINAL=${total_required:.2f}")
             
             return total_required
             
         except Exception as e:
             logger.error(f"❌ Margin hesaplama hatası: {e}")
-            # Güvenli varsayılan: pozisyon değerinin %15'i
-            return (amount * price) * 0.15
+            # ÇOK güvenli varsayılan: pozisyon değerinin %40'ı
+            ultra_conservative_fallback = (amount * price) * 0.40
+            logger.warning(f"❌ [{symbol}] Ultra conservative fallback margin: ${ultra_conservative_fallback:.2f}")
+            return ultra_conservative_fallback
 
     async def validate_margin_before_trade(self, symbol: str, position_size: float, price: float) -> Tuple[bool, str]:
         """Validate sufficient margin before opening position"""
