@@ -2717,36 +2717,109 @@ class CryptoNewsBot:
             # ------------------------------------
 
     async def execute_live_trade(self, signal: TradeSignal, news_item: NewsItem):
+        """İyileştirilmiş live trade execution"""
         symbol = signal.symbol
         try:
-            logger.info(f"--- CANLI İŞLEM BAŞLATILIYOR (V5 Mantığı): {signal.action} {symbol} ---")
+            logger.info(f"--- CANLI İŞLEM BAŞLATILIYOR (Enhanced V14): {signal.action} {symbol} ---")
             
-            # Pozisyon büyüklüğünü V10'daki dinamik fonksiyonla hesapla
+            # 1. ÖNCE MEVCUT POZİSYONLARI KONTROL ET VE KAPAT
+            logger.info(f"🔍 [{symbol}] Mevcut pozisyonlar kontrol ediliyor...")
+            
+            try:
+                params = {}
+                if self.exchange.id == 'gateio':
+                    params = {'settle': 'usdt'}
+                    
+                positions = await self.loop.run_in_executor(None, lambda: self.exchange.fetch_positions([], params))
+                for pos in positions:
+                    if pos['symbol'] == symbol and float(pos.get('contracts', 0)) > 0:
+                        logger.warning(f"⚠️ [{symbol}] Mevcut pozisyon bulundu: {pos['contracts']} kontrat, kapatılıyor...")
+                        # Pozisyonu kapat
+                        close_side = 'sell' if pos['side'] == 'long' else 'buy'
+                        await self.loop.run_in_executor(
+                            None,
+                            lambda: self.exchange.create_market_order(
+                                symbol, 
+                                close_side, 
+                                float(pos['contracts']),
+                                params={'settle': 'usdt', 'reduceOnly': True}
+                            )
+                        )
+                        await asyncio.sleep(3)  # API delay
+                        logger.info(f"✅ [{symbol}] Mevcut pozisyon kapatıldı")
+                        
+            except Exception as e:
+                logger.warning(f"⚠️ [{symbol}] Pozisyon kontrolü hatası: {e}")
+
+            # 2. HESAP RİSK SEVİYESİNİ KONTROL ET
+            try:
+                balance_data = await self.loop.run_in_executor(None, lambda: self.exchange.fetch_balance({'settle': 'usdt'}))
+                if 'info' in balance_data and 'risk_level' in balance_data['info']:
+                    risk_level = float(balance_data['info']['risk_level'])
+                    if risk_level > 0.8:  # %80'den yüksek risk
+                        logger.error(f"❌ [{symbol}] Yüksek risk seviyesi: {risk_level:.2f}, trade iptal")
+                        await self.telegram.send_message(
+                            f"🚨 <b>Yüksek Risk Seviyesi!</b>\n"
+                            f"<b>Coin:</b> {symbol}\n"
+                            f"<b>Risk:</b> {risk_level:.2f} (>80%)\n"
+                            f"<b>Durum:</b> Trade iptal edildi"
+                        )
+                        return False
+                    logger.info(f"✅ [{symbol}] Risk seviyesi uygun: {risk_level:.2f}")
+            except Exception as e:
+                logger.warning(f"⚠️ Risk seviyesi kontrol edilemedi: {e}")
+
+            # 3. INITIAL POSITION SIZE CALCULATION
             amount = await self.calculate_live_position_size(symbol, signal.entry_price, signal.stop_loss)
             if not amount or amount <= 0:
                 logger.warning(f"[{symbol}] Pozisyon büyüklüğü sıfır veya negatif. İşlem iptal.")
-                return
+                return False
 
-            # ✅ MARGIN VALIDATION BEFORE TRADE
+            # 4. GERÇEKÇİ MARGİN KONTROLÜ VE DİNAMİK KÜÇÜLTME
+            available_balance = await self.get_futures_balance()
+            if available_balance is None:
+                logger.error(f"❌ [{symbol}] Bakiye alınamadı, trade iptal")
+                return False
+            
+            required_margin = await self.calculate_required_margin(symbol, amount, signal.entry_price)
+            
+            if available_balance < required_margin:
+                logger.warning(f"⚠️ [{symbol}] Yetersiz margin, pozisyon küçültülüyor...")
+                
+                # %30'a kadar küçült
+                for reduction in [0.7, 0.5, 0.3]:
+                    reduced_amount = amount * reduction
+                    reduced_margin = await self.calculate_required_margin(symbol, reduced_amount, signal.entry_price)
+                    
+                    logger.info(f"📉 [{symbol}] Test ediliyor: {reduced_amount:.4f} kontrat için ${reduced_margin:.2f} margin")
+                    
+                    if available_balance >= reduced_margin:
+                        amount = reduced_amount
+                        required_margin = reduced_margin
+                        logger.info(f"📉 [{symbol}] Pozisyon küçültüldü: {amount:.4f} (Margin: ${required_margin:.2f})")
+                        break
+                else:
+                    logger.error(f"❌ [{symbol}] Trade iptal: Minimum margin bile karşılanamıyor")
+                    await self.telegram.send_message(
+                        f"💸 <b>Margin Yetersiz</b>\n"
+                        f"<b>Coin:</b> {symbol}\n"
+                        f"<b>Durum:</b> %30'a kadar küçültülmesine rağmen margin yetersiz\n"
+                        f"<b>Gerekli:</b> ${required_margin:.2f}\n"
+                        f"<b>Mevcut:</b> ${available_balance:.2f}"
+                    )
+                    return False
+
+            # 5. FINAL MARGIN VALIDATION
             margin_valid, margin_message = await self.validate_margin_before_trade(symbol, amount, signal.entry_price)
             if not margin_valid:
-                logger.error(f"❌ [{symbol}] Margin validation failed: {margin_message}")
-                await self.telegram.send_message(f"💸 <b>Margin Error</b>\n<b>Coin:</b> {symbol}\n<b>Reason:</b> {margin_message}")
-                
-                # Try with reduced position size (50% of original)
-                reduced_amount = amount * 0.5
-                margin_valid_reduced, margin_message_reduced = await self.validate_margin_before_trade(symbol, reduced_amount, signal.entry_price)
-                if margin_valid_reduced:
-                    logger.info(f"✅ [{symbol}] Using reduced position size: {reduced_amount}")
-                    amount = reduced_amount
-                else:
-                    logger.error(f"❌ [{symbol}] Even reduced position size fails margin check. Skipping trade.")
-                    return
+                logger.error(f"❌ [{symbol}] Final margin validation failed: {margin_message}")
+                await self.telegram.send_message(f"💸 <b>Final Margin Error</b>\n<b>Coin:</b> {symbol}\n<b>Reason:</b> {margin_message}")
+                return False
 
-            # ANA PİYASA EMRİNİ GÖNDER
-            logger.info(f"[{symbol}] Ana piyasa emri gönderiliyor: {amount} kontrat")
+            # 6. TRADE EXECUTION
+            logger.info(f"📊 [{symbol}] Final trade: {amount:.4f} kontrat, Margin: ${required_margin:.2f}")
             
-            # Kaldıraç parametresini ekleyerek V10'daki hatayı çözmeye çalışalım
+            # Kaldıraç parametresini ekle
             params = {'settle': 'usdt', 'leverage': '10'}
 
             order = await self.loop.run_in_executor(
@@ -2762,14 +2835,18 @@ class CryptoNewsBot:
                 
                 # SL/TP kurma ve pozisyonu kaydetme işini ayrı bir fonksiyona devret
                 await self.setup_position_protections(signal, order, news_item)
+                return True
             else:
                 logger.error(f"❌ [{symbol}] Ana emir gerçekleşmedi: {order}")
+                return False
 
         except ccxt.InsufficientFunds as e:
             logger.error(f"💸 [{symbol}] Yetersiz bakiye: {e}")
             await self.telegram.send_message(f"💸 <b>Yetersiz Bakiye</b>\n<b>Coin:</b> {symbol}\n<code>{e}</code>")
+            return False
         except Exception as e:
             logger.critical(f"❌ [{symbol}] execute_live_trade kritik hatası: {e}", exc_info=True)
+            return False
 
     async def setup_position_protections(self, signal: TradeSignal, order: dict, news_item: NewsItem):
         symbol = signal.symbol
@@ -3058,6 +3135,41 @@ class CryptoNewsBot:
             logger.error(f"Bakiye alınamadı: {e}")
             return None
 
+    async def calculate_required_margin(self, symbol, amount, price, leverage=None):
+        """Gerçek margin hesaplama - Gate.io API'sine uygun"""
+        try:
+            # Market info al
+            market = self.exchange.market(symbol)
+            
+            # Pozisyon değeri
+            position_value = amount * price
+            
+            # Leverage bilgisi al (eğer verilmemişse)
+            if not leverage:
+                # Account info'dan leverage al
+                try:
+                    account_info = await self.loop.run_in_executor(None, self.exchange.fetch_trading_fees)
+                    leverage = 10  # Varsayılan
+                except:
+                    leverage = 10  # Varsayılan
+            
+            # Gate.io için gerçek margin hesaplama
+            # Minimum margin + fees + buffer
+            base_margin = position_value / leverage
+            trading_fee = position_value * 0.0004  # %0.04 gate.io fee
+            buffer = base_margin * 0.1  # %10 safety buffer
+            
+            total_required = base_margin + trading_fee + buffer
+            
+            logger.info(f"💰 [{symbol}] Margin detayı: Position=${position_value:.2f}, Base=${base_margin:.2f}, Fee=${trading_fee:.2f}, Total=${total_required:.2f}")
+            
+            return total_required
+            
+        except Exception as e:
+            logger.error(f"❌ Margin hesaplama hatası: {e}")
+            # Güvenli varsayılan: pozisyon değerinin %15'i
+            return (amount * price) * 0.15
+
     async def validate_margin_before_trade(self, symbol: str, position_size: float, price: float) -> Tuple[bool, str]:
         """Validate sufficient margin before opening position"""
         try:
@@ -3068,7 +3180,10 @@ class CryptoNewsBot:
             
             free_usdt = balance
             
-            required_margin = position_size * price * 0.1  # 10% margin requirement
+            # Yeni gerçekçi margin hesaplama
+            required_margin = await self.calculate_required_margin(symbol, position_size, price)
+            
+            logger.info(f"✅ [{symbol}] Margin validation: Required ${required_margin:.2f}, Available ${free_usdt:.2f}")
             
             if free_usdt < required_margin:
                 logger.warning(f"Insufficient margin for {symbol}: Need {required_margin:.2f} USDT, Have {free_usdt:.2f} USDT")
