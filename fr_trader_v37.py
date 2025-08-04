@@ -339,6 +339,10 @@ class TradingConfig:
         # ===== CACHE & HISTORY SETTINGS =====
         self.MAX_TRADE_HISTORY_SIZE = int(os.getenv('MAX_TRADE_HISTORY_SIZE', '1000'))
         self.MODEL_CACHE_MAX_AGE_HOURS = int(os.getenv('MODEL_CACHE_MAX_AGE_HOURS', '2'))
+        
+        # ===== FR RESET SETTINGS =====
+        self.FR_RESET_DELAY_MINUTES = int(os.getenv('FR_RESET_DELAY_MINUTES', '20'))
+        self.ENABLE_FR_RESET_COOLDOWN = bool(os.getenv('ENABLE_FR_RESET_COOLDOWN', 'True').lower() in ['true', '1', 't', 'y', 'yes'])
     
     def set_value(self, key: str, value_str: str) -> bool:
         """Set configuration value dynamically"""
@@ -2520,33 +2524,8 @@ class AdvancedFeatureEngineer:
 
 # === NEURAL NETWORK PREDICTOR SINIFINI AdvancedFeatureEngineer'DAN SONRA EKLEYİN ===
 
-try:
-    import tensorflow as tf
-    print(f"✅ TensorFlow imported successfully: {tf.__version__}")
-    
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import Dense, Dropout, LSTM, BatchNormalization
-    from tensorflow.keras.optimizers import Adam
-    from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-    from tensorflow.keras.regularizers import l2
-    
-    TENSORFLOW_AVAILABLE = True
-    
-    # TensorFlow loglarını azalt
-    tf.get_logger().setLevel('ERROR')
-    
-    print("🧠 Neural Networks will be ENABLED")
-    logging.info(f"TensorFlow {tf.__version__} loaded successfully for Neural Networks")
-    
-except ImportError as e:
-    print(f"❌ TensorFlow ImportError: {e}")
-    TENSORFLOW_AVAILABLE = False
-    logging.warning(f"TensorFlow not available. ImportError: {e}")
-    
-except Exception as e:
-    print(f"❌ TensorFlow Exception: {e}")
-    TENSORFLOW_AVAILABLE = False
-    logging.warning(f"TensorFlow error: {e}")
+# TensorFlow imports are handled globally by initialize_tensorflow() function
+# Use the global TENSORFLOW_AVAILABLE variable and tf_module reference
 
 class NeuralNetworkPredictor:
     """TensorFlow ile Neural Network modelleri - daha akıllı predictions"""
@@ -2563,8 +2542,16 @@ class NeuralNetworkPredictor:
     
     def _create_dense_model(self, input_dim: int):  # Type hint kaldırıldı
         """Dense Neural Network modeli oluştur"""
-        if not TENSORFLOW_AVAILABLE:
+        if not TENSORFLOW_AVAILABLE or tf_module is None:
             raise ValueError("TensorFlow not available")
+            
+        # Use global tf_module reference
+        Sequential = tf_module.keras.models.Sequential
+        Dense = tf_module.keras.layers.Dense
+        BatchNormalization = tf_module.keras.layers.BatchNormalization
+        Dropout = tf_module.keras.layers.Dropout
+        Adam = tf_module.keras.optimizers.Adam
+        l2 = tf_module.keras.regularizers.l2
             
         model = Sequential([
             # Input layer
@@ -2594,8 +2581,16 @@ class NeuralNetworkPredictor:
     
     def _create_lstm_model(self, input_dim: int, sequence_length: int):  # Type hint kaldırıldı
         """LSTM modeli oluştur (sequential data için)"""
-        if not TENSORFLOW_AVAILABLE:
+        if not TENSORFLOW_AVAILABLE or tf_module is None:
             raise ValueError("TensorFlow not available")
+            
+        # Use global tf_module reference
+        Sequential = tf_module.keras.models.Sequential
+        LSTM = tf_module.keras.layers.LSTM
+        Dense = tf_module.keras.layers.Dense
+        BatchNormalization = tf_module.keras.layers.BatchNormalization
+        Dropout = tf_module.keras.layers.Dropout
+        Adam = tf_module.keras.optimizers.Adam
             
         model = Sequential([
             # LSTM layers
@@ -2638,7 +2633,7 @@ class NeuralNetworkPredictor:
     
     def fit(self, X: np.ndarray, y: np.ndarray):
         """Neural Network modellerini train et"""
-        if not TENSORFLOW_AVAILABLE:
+        if not TENSORFLOW_AVAILABLE or tf_module is None:
             raise ValueError("TensorFlow not available for Neural Network training")
         
         if len(X) < 100:  # NN için daha fazla data gerekir
@@ -2654,6 +2649,10 @@ class NeuralNetworkPredictor:
             split_idx = int(len(X) * 0.8)
             X_train, X_val = X[:split_idx], X[split_idx:]
             y_train, y_val = y[:split_idx], y[split_idx:]
+            
+            # Use global tf_module reference for callbacks
+            EarlyStopping = tf_module.keras.callbacks.EarlyStopping
+            ReduceLROnPlateau = tf_module.keras.callbacks.ReduceLROnPlateau
             
             # Callbacks
             early_stopping = EarlyStopping(
@@ -2846,6 +2845,98 @@ class NeuralNetworkPredictor:
             model_info['models'].append(info)
         
         return model_info
+
+# ===== FR RESET MANAGER =====
+class FRResetManager:
+    """
+    FR Reset sonrası bekleme logic'i yönetir.
+    FR reset sonrası genellikle ilk 15-20 dakika düşüş oluyor - bu süreyi bekler.
+    """
+    
+    def __init__(self, fr_reset_delay_minutes: int = 20):
+        self.fr_reset_delay_minutes = fr_reset_delay_minutes
+        self.last_fr_reset_time = None
+        self.is_in_fr_reset_cooldown = False
+        
+        # FR reset zamanları (UTC): 00:00, 08:00, 16:00
+        self.fr_reset_hours = [0, 8, 16]
+        
+        logging.info(f"FRResetManager initialized with {fr_reset_delay_minutes} minute delay")
+    
+    async def check_fr_reset_status(self) -> bool:
+        """FR reset sonrası bekleme durumunu kontrol et"""
+        try:
+            current_time = datetime.now(pytz.UTC)  # UTC timezone kullan
+            current_hour = current_time.hour
+            current_minute = current_time.minute
+            
+            # FR reset saatlerinden birinde miyiz?
+            if current_hour in self.fr_reset_hours:
+                # Reset zamanını hesapla (tam saat)
+                reset_time = current_time.replace(minute=0, second=0, microsecond=0)
+                
+                # Reset'ten bu yana geçen süre (dakika)
+                time_since_reset = (current_time - reset_time).total_seconds() / 60
+                
+                # Eğer reset'ten sonra belirlenen süre geçmemişse cooldown aktif
+                if 0 <= time_since_reset <= self.fr_reset_delay_minutes:
+                    self.is_in_fr_reset_cooldown = True
+                    self.last_fr_reset_time = reset_time
+                    return True
+            
+            self.is_in_fr_reset_cooldown = False
+            return False
+            
+        except Exception as e:
+            logging.error(f"Error checking FR reset status: {e}")
+            self.is_in_fr_reset_cooldown = False
+            return False
+    
+    async def should_skip_trading_due_to_fr_reset(self) -> bool:
+        """FR reset cooldown nedeniyle trading'i skip etmeli mi?"""
+        is_cooldown = await self.check_fr_reset_status()
+        
+        if is_cooldown:
+            remaining_time = self.get_remaining_cooldown_time()
+            logging.info(f"🔄 FR Reset cooldown aktif - Trading skip ediliyor. Kalan süre: {remaining_time:.1f} dakika")
+            return True
+            
+        return False
+    
+    def get_remaining_cooldown_time(self) -> float:
+        """Kalan cooldown süresini dakika olarak döndür"""
+        if not self.is_in_fr_reset_cooldown or not self.last_fr_reset_time:
+            return 0.0
+            
+        current_time = datetime.now(pytz.UTC)
+        elapsed_minutes = (current_time - self.last_fr_reset_time).total_seconds() / 60
+        remaining_minutes = max(0, self.fr_reset_delay_minutes - elapsed_minutes)
+        
+        return remaining_minutes
+    
+    def get_next_fr_reset_time(self) -> datetime:
+        """Bir sonraki FR reset zamanını döndür"""
+        current_time = datetime.now(pytz.UTC)
+        current_hour = current_time.hour
+        
+        # Bugün için kalan reset zamanlarını kontrol et
+        for reset_hour in self.fr_reset_hours:
+            if reset_hour > current_hour:
+                return current_time.replace(hour=reset_hour, minute=0, second=0, microsecond=0)
+        
+        # Bugün kalan reset yok, yarının ilk reset'i
+        next_day = current_time + timedelta(days=1)
+        return next_day.replace(hour=self.fr_reset_hours[0], minute=0, second=0, microsecond=0)
+    
+    def get_fr_reset_status_dict(self) -> Dict[str, Any]:
+        """FR reset durumu bilgilerini dict olarak döndür (dashboard için)"""
+        return {
+            'is_in_cooldown': self.is_in_fr_reset_cooldown,
+            'remaining_minutes': self.get_remaining_cooldown_time(),
+            'last_reset_time': self.last_fr_reset_time.isoformat() if self.last_fr_reset_time else None,
+            'next_reset_time': self.get_next_fr_reset_time().isoformat(),
+            'delay_minutes': self.fr_reset_delay_minutes
+        }
 
 class DynamicSLTPManager:
     """
@@ -3902,8 +3993,26 @@ class TelegramCommandHandler:
 
                 f"<b><u>CURRENT SETTINGS</u></b>\n"
                 f"► <b>FR Threshold:</b> {config.FR_LONG_THRESHOLD}%\n"
-                f"► <b>AI Confidence:</b> {config.AI_CONFIDENCE_THRESHOLD * 100:.0f}%"
+                f"► <b>AI Confidence:</b> {config.AI_CONFIDENCE_THRESHOLD * 100:.0f}%\n\n"
             )
+            
+            # ===== FR RESET STATUS EKLEME =====
+            if config.ENABLE_FR_RESET_COOLDOWN:
+                fr_status = self.bot.fr_reset_manager.get_fr_reset_status_dict()
+                if fr_status['is_in_cooldown']:
+                    fr_emoji = "🔄"
+                    message += (
+                        f"<b><u>FR RESET STATUS</u></b>\n"
+                        f"{fr_emoji} <b>Cooldown Active:</b> {fr_status['remaining_minutes']:.1f} min remaining\n"
+                        f"► <b>Trading paused</b> until FR reset cooldown ends\n\n"
+                    )
+                else:
+                    next_reset = datetime.fromisoformat(fr_status['next_reset_time'])
+                    message += (
+                        f"<b><u>FR RESET STATUS</u></b>\n"
+                        f"✅ <b>Trading Active</b>\n"
+                        f"► <b>Next Reset:</b> {next_reset.strftime('%H:%M UTC')}\n\n"
+                    )
             
             await self.bot.send_telegram(message)
             
@@ -4541,6 +4650,9 @@ class FRHunterV12:
         # Error recovery and emergency management
         self.error_recovery = ErrorRecoveryManager(self)
         logging.info("Error recovery system initialized")
+        # FR Reset Manager
+        self.fr_reset_manager = FRResetManager(config.FR_RESET_DELAY_MINUTES)
+        logging.info(f"FR Reset Manager initialized with {config.FR_RESET_DELAY_MINUTES} minute delay")
         # ==========================================
 
         # Model kullanım takibi (LRU benzeri)
@@ -6667,6 +6779,12 @@ class FRHunterV12:
         V36 - Signal Funnel Edition.
         Adayları en ucuzdan en pahalıya doğru filtreler ve her adımı loglar.
         """
+        # ===== FR RESET COOLDOWN KONTROLÜ =====
+        if config.ENABLE_FR_RESET_COOLDOWN:
+            should_skip = await self.fr_reset_manager.should_skip_trading_due_to_fr_reset()
+            if should_skip:
+                return  # FR reset cooldown aktif, trading'i skip et
+        
         if len(self.active_positions) >= config.MAX_ACTIVE_TRADES:
             logging.info(f"Max active trades ({config.MAX_ACTIVE_TRADES}) reached. Skipping scan.")
             return
@@ -6977,10 +7095,6 @@ class FRHunterV12:
         except Exception as e:
             logging.error(f"Model training wrapper failed for {symbol}: {e}", exc_info=True)
             return False
-
-    async def get_current_price(self, symbol: str) -> Optional[float]:
-        ticker = await self._api_request_with_retry('GET', '/fapi/v1/ticker/price', {'symbol': symbol})
-        return float(ticker['price']) if ticker and 'price' in ticker else None
 
     async def load_trade_history(self):
         """V15.4 - Gelişmiş Teşhis ve Güvenli Veri Yorumlama ile Trade History Yükleme"""
