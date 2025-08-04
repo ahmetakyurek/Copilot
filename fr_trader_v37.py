@@ -3274,6 +3274,180 @@ class TradingDashboard:
         self.dashboard_active = False
         logging.info("Real-time dashboard monitoring stopped")
 
+# ===== ML PIPELINE ORGANIZATION =====
+class MLPipeline:
+    """
+    Organized ML workflow for better model management
+    Centralizes feature store, model registry, and experiment tracking
+    """
+    
+    def __init__(self, bot_instance):
+        self.bot = bot_instance
+        self.feature_store = {}  # Simple feature store
+        self.model_registry = {}  # Model performance tracking
+        self.experiment_results = {}  # Experiment tracking
+        
+        logging.info("ML Pipeline initialized")
+    
+    async def prepare_training_data(self, symbol: str, days: int = 30) -> Optional[Tuple[pd.DataFrame, pd.Series]]:
+        """Prepare standardized training data for a symbol"""
+        try:
+            # Get recent trades for this symbol
+            recent_trades = await self.bot.db_manager.load_recent_trades(days)
+            symbol_trades = [t for t in recent_trades if t.get('symbol') == symbol]
+            
+            if len(symbol_trades) < 50:  # Need minimum samples
+                logging.warning(f"Insufficient training data for {symbol}: {len(symbol_trades)} samples")
+                return None
+            
+            # Get market data
+            klines = await self.bot._api_request_with_retry(
+                'GET', '/fapi/v1/klines', 
+                {'symbol': symbol, 'interval': '5m', 'limit': 500}
+            )
+            
+            if not klines:
+                return None
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(klines, columns=[
+                'open_time', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_volume', 'count', 'taker_buy_volume',
+                'taker_buy_quote_volume', 'ignore'
+            ])
+            
+            # Convert numeric columns
+            numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+            for col in numeric_cols:
+                df[col] = pd.to_numeric(df[col])
+            
+            # Generate features
+            features_df = await self.bot.feature_engineer.create_features(df)
+            
+            # Create labels from trade history
+            labels = self._create_labels_from_trades(features_df, symbol_trades)
+            
+            if len(labels) != len(features_df):
+                logging.warning(f"Feature-label mismatch for {symbol}")
+                return None
+            
+            return features_df, labels
+            
+        except Exception as e:
+            logging.error(f"Error preparing training data for {symbol}: {e}")
+            return None
+    
+    def _create_labels_from_trades(self, df: pd.DataFrame, trades: List[Dict]) -> pd.Series:
+        """Create binary labels from successful trades"""
+        labels = pd.Series(0, index=df.index)  # Default to 0 (no trade)
+        
+        for trade in trades:
+            if trade.get('pnl_usd', 0) > 0:  # Profitable trade
+                # Find approximate time in dataframe
+                # This is simplified - in practice you'd match timestamps more precisely
+                entry_time = trade.get('entry_time')
+                if entry_time and len(labels) > 10:
+                    # Mark last 10% of data as positive if trade was profitable
+                    start_idx = int(len(labels) * 0.9)
+                    labels.iloc[start_idx:] = 1
+                    break
+        
+        return labels
+    
+    async def train_and_evaluate(self, symbol: str) -> Dict[str, Any]:
+        """Train model and evaluate performance"""
+        try:
+            # Prepare data
+            data_result = await self.prepare_training_data(symbol)
+            if data_result is None:
+                return {'error': 'Failed to prepare training data'}
+            
+            features_df, labels = data_result
+            
+            # Use existing model training infrastructure
+            if hasattr(self.bot, 'model_cache'):
+                model_key = f"ml_pipeline_{symbol}"
+                
+                # Check if model exists in cache
+                cached_model = self.bot.model_cache.get_model(model_key)
+                if cached_model:
+                    # Evaluate existing model
+                    metrics = self._evaluate_model(cached_model, features_df, labels)
+                    self.model_registry[symbol] = metrics
+                    return metrics
+                else:
+                    # Train new model using existing ensemble predictor
+                    try:
+                        # Create ensemble predictor
+                        from sklearn.ensemble import RandomForestClassifier
+                        model = RandomForestClassifier(n_estimators=100, random_state=42)
+                        
+                        # Prepare data
+                        X = features_df.select_dtypes(include=[np.number]).fillna(0)
+                        y = labels
+                        
+                        # Train
+                        model.fit(X, y)
+                        
+                        # Store in cache
+                        self.bot.model_cache.store_model(model_key, model, X.shape[1])
+                        
+                        # Evaluate
+                        metrics = self._evaluate_model(model, X, y)
+                        self.model_registry[symbol] = metrics
+                        
+                        return metrics
+                        
+                    except Exception as train_error:
+                        logging.error(f"Model training failed for {symbol}: {train_error}")
+                        return {'error': f'Training failed: {train_error}'}
+            
+            return {'error': 'Model cache not available'}
+            
+        except Exception as e:
+            logging.error(f"ML pipeline training failed for {symbol}: {e}")
+            return {'error': str(e)}
+    
+    def _evaluate_model(self, model, X: pd.DataFrame, y: pd.Series) -> Dict[str, float]:
+        """Evaluate model performance"""
+        try:
+            # Simple train/test split
+            split_idx = int(len(X) * 0.8)
+            X_train, X_test = X[:split_idx], X[split_idx:]
+            y_train, y_test = y[:split_idx], y[split_idx:]
+            
+            # Predict
+            y_pred = model.predict(X_test)
+            
+            # Calculate metrics
+            accuracy = (y_pred == y_test).mean()
+            precision = precision_score(y_test, y_pred, zero_division=0)
+            
+            # Count positives
+            positive_rate = y_test.mean()
+            prediction_rate = y_pred.mean()
+            
+            return {
+                'accuracy': float(accuracy),
+                'precision': float(precision),
+                'positive_rate': float(positive_rate),
+                'prediction_rate': float(prediction_rate),
+                'sample_count': len(y_test)
+            }
+            
+        except Exception as e:
+            logging.error(f"Model evaluation failed: {e}")
+            return {'error': str(e)}
+    
+    def get_model_performance_summary(self) -> Dict[str, Any]:
+        """Get summary of all model performance"""
+        return {
+            'models_trained': len(self.model_registry),
+            'performance_by_symbol': self.model_registry,
+            'average_accuracy': np.mean([m.get('accuracy', 0) for m in self.model_registry.values() if 'accuracy' in m]),
+            'average_precision': np.mean([m.get('precision', 0) for m in self.model_registry.values() if 'precision' in m])
+        }
+
 class DynamicSLTPManager:
     """
     Dynamic Stop Loss / Take Profit Manager
@@ -3899,6 +4073,7 @@ class TelegramCommandHandler:
             '/shutdown': self.cmd_shutdown,
             '/ai': self.cmd_ai_status,
             '/dashboard': self.cmd_dashboard,
+            '/ml': self.cmd_ml_pipeline,
             '/ai_details': self.cmd_ai_details,
             '/debug': self.cmd_debug,
             '/fr': self.cmd_fr,
@@ -4090,7 +4265,10 @@ class TelegramCommandHandler:
             "<code>/errors</code> - Recent errors\n\n"
             "<b>🧠 AI System:</b>\n"
             "<code>/ai</code> - AI models & features status\n"
-            "<code>/ai_details</code> - Detailed AI model info\n\n"
+            "<code>/ai_details</code> - Detailed AI model info\n"
+            "<code>/ml</code> - ML Pipeline status & performance\n\n"
+            "<b>📊 Monitoring:</b>\n"
+            "<code>/dashboard</code> - Toggle real-time dashboard\n\n"
             "<b>🚨 Error Recovery:</b>\n"
             "<code>/recovery</code> - Recovery system status\n"
             "<code>/emergency</code> - Emergency mode info\n"
@@ -4998,6 +5176,38 @@ class TelegramCommandHandler:
             logging.error(f"Error with dashboard command: {e}")
             await self.bot.send_telegram(f"❌ Dashboard error: {e}")
 
+    async def cmd_ml_pipeline(self):
+        """ML Pipeline management command"""
+        try:
+            performance_summary = self.bot.ml_pipeline.get_model_performance_summary()
+            
+            message = (
+                f"🤖 <b>ML PIPELINE STATUS</b>\n\n"
+                f"<b>Overview:</b>\n"
+                f"► <b>Models Trained:</b> {performance_summary['models_trained']}\n"
+                f"► <b>Avg Accuracy:</b> {performance_summary['average_accuracy']:.2%}\n"
+                f"► <b>Avg Precision:</b> {performance_summary['average_precision']:.2%}\n\n"
+            )
+            
+            if performance_summary['performance_by_symbol']:
+                message += "<b>Symbol Performance:</b>\n"
+                for symbol, metrics in list(performance_summary['performance_by_symbol'].items())[:5]:  # Show top 5
+                    if 'error' not in metrics:
+                        message += f"• <code>{symbol}</code>: {metrics.get('accuracy', 0):.1%} acc, {metrics.get('precision', 0):.1%} prec\n"
+                
+                if len(performance_summary['performance_by_symbol']) > 5:
+                    message += f"<i>... and {len(performance_summary['performance_by_symbol']) - 5} more</i>\n"
+            else:
+                message += "<i>No models trained yet</i>\n"
+            
+            message += f"\n<i>Use ML pipeline for organized model training and evaluation</i>"
+            
+            await self.bot.send_telegram(message)
+            
+        except Exception as e:
+            logging.error(f"Error with ML pipeline command: {e}")
+            await self.bot.send_telegram(f"❌ ML Pipeline error: {e}")
+
 
 # ===== MAIN TRADING CLASS (V13) =====
 class FRHunterV12:
@@ -5024,6 +5234,9 @@ class FRHunterV12:
         # Real-time Dashboard
         self.dashboard = TradingDashboard(self)
         logging.info("Real-time dashboard initialized")
+        # ML Pipeline
+        self.ml_pipeline = MLPipeline(self)
+        logging.info("ML Pipeline initialized")
         # ==========================================
 
         # Model kullanım takibi (LRU benzeri)
